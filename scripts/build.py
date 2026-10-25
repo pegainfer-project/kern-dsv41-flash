@@ -42,10 +42,6 @@ def prepare():
     if missing:
         raise SystemExit(f"missing submodules {missing}: run scripts/fetch.sh")
     shutil.rmtree(ROOT / UPSTREAM, ignore_errors=True)
-    patched = UPSTREAM / "deepgemm-patched"
-    shutil.copytree(ROOT / "third_party/DeepGEMM/deep_gemm/include", ROOT / patched / "include")
-    for patch in sorted((ROOT / "patches").glob("deepgemm-*.patch")):
-        run("patch", "-s", "-p1", "-d", patched, "-i", patch)
     (ROOT / UPSTREAM / "mega-moe").mkdir(parents=True)
     run("python3", "source/moe/fork_moe.py", "third_party/DeepGEMM", UPSTREAM / "mega-moe/sm100_fp8_fp4_mega_moe.cuh")
     (ROOT / UPSTREAM / "flashmla-fused").mkdir(parents=True)

@@ -32,15 +32,11 @@ deepgemm = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "-DDG_NO_TORCH"]
 lambda = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG"]
 
 # Include paths, searched in order. `build/upstream/` is what `build.py`
-# prepares from the submodules: DeepGEMM with `patches/` applied, MegaMoE
-# forked onto kern's peer table, FlashMLA's fused core with its NVCC 13 fix.
+# prepares from the submodules: MegaMoE forked onto kern's peer table,
+# FlashMLA's fused core with its NVCC 13 fix.
 [includes]
 deepgemm = [
     "third_party/DeepGEMM/deep_gemm/include",
-    "third_party/DeepGEMM/third-party/cutlass/include",
-]
-deepgemm-patched = [
-    "build/upstream/deepgemm-patched/include",
     "third_party/DeepGEMM/third-party/cutlass/include",
 ]
 mega-moe = [
@@ -95,23 +91,23 @@ sha256 = "f8d2c2761ceafffd0e50f1d159de9ab3410b661e42af2da74f1e5eed26a04626"
 [kernels.dsv41_mhc]
 source = "source/moe/mega_mhc.cu"
 flags = "deepgemm"
-includes = "deepgemm-patched"
+includes = "deepgemm"
 programs = ["prefill"]
-sha256 = "4c6b3c5844f1dfe77f01a29f3dd1765be5479e63790ebc7c20df6466ad68aa0d"
+sha256 = "8e07ee003d917d31ccc5d4b1c1711d79138e97619936eada3057212d376aa802"
 
 [kernels.dsv41_gate]
 source = "source/moe/mega_gate.cu"
 flags = "deepgemm"
-includes = "deepgemm-patched"
+includes = "deepgemm"
 programs = ["prefill"]
-sha256 = "25443e977206b8bd50db2881e67bec2c0b0aece4b0718356e56216b7597a5796"
+sha256 = "efca572e7555d7c425260e98e2a0c5ea3ae6568e562cdd36ebc5253e03fbda8d"
 
 [kernels.dsv41_dense]
 source = "source/moe/dense.cu"
 flags = "deepgemm"
-includes = "deepgemm-patched"
+includes = "deepgemm"
 programs = ["prefill"]
-sha256 = "e3bf344bf9ea82c8cebfe6fc2943e0f1464756ccace65a935d1529c82f5dfcb8"
+sha256 = "e713c3a672e095a8de49957bb84a9fdf7b963c5f5004f573a1df87078e3c772c"
 
 [kernels.dsv41_mega_moe]
 source = "source/moe/mega_moe.cu"

@@ -8,7 +8,7 @@ in [`kernels.toml`](kernels.toml).
 
 kern contains no model. This repository holds the model's kernel sources,
 the upstream kernel libraries they instantiate (as submodules, at the
-commits the cubins were built from), the patches applied to those, and the
+commits the cubins were built from, unmodified), and the
 build that turns them into the cubins a manifest pins.
 
 ## Build
@@ -44,9 +44,9 @@ submodule sits at the commit recorded under `[upstreams]`.
 | `dsv41_engram_peers` | [`auxiliary/engram_peers.cu`](source/auxiliary/engram_peers.cu) | — | prefill |
 | `dsv41_head` | [`head.cu`](source/head.cu) | — | prefill |
 | `dsv41_moe_boundary` | [`moe/boundary.cu`](source/moe/boundary.cu) | — | prefill |
-| `dsv41_mhc` | [`moe/mega_mhc.cu`](source/moe/mega_mhc.cu) | DeepGEMM + [`patches/`](patches/) | prefill |
-| `dsv41_gate` | [`moe/mega_gate.cu`](source/moe/mega_gate.cu) | DeepGEMM + [`patches/`](patches/) | prefill |
-| `dsv41_dense` | [`moe/dense.cu`](source/moe/dense.cu) | DeepGEMM + [`patches/`](patches/) | prefill |
+| `dsv41_mhc` | [`moe/mega_mhc.cu`](source/moe/mega_mhc.cu) | DeepGEMM | prefill |
+| `dsv41_gate` | [`moe/mega_gate.cu`](source/moe/mega_gate.cu) | DeepGEMM | prefill |
+| `dsv41_dense` | [`moe/dense.cu`](source/moe/dense.cu) | DeepGEMM | prefill |
 | `dsv41_mega_moe` | [`moe/mega_moe.cu`](source/moe/mega_moe.cu) | DeepGEMM MegaMoE, forked onto kern's peer table by [`fork_moe.py`](source/moe/fork_moe.py) | prefill |
 | `dsv41_moe_stage` | [`moe/stage.cu`](source/moe/stage.cu) | — | prefill |
 | `dsv41_weight_prep` | [`moe/weight_prep.cu`](source/moe/weight_prep.cu) | — | load |
@@ -80,6 +80,10 @@ python3 source/auxiliary/engram_constants.py <checkpoint> <checkpoint>/inference
 | [DeepSelect](https://github.com/deepseek-ai/DeepSelect) | `8e70df7` | MIT |
 
 Each keeps its own license in its tree. `build.py` never modifies a
-submodule: patched and forked copies go to `build/upstream/`.
-[`patches/`](patches/) says what each patch changes and why. The sources
+submodule; its two source transforms write to `build/upstream/`:
+[`fork_moe.py`](source/moe/fork_moe.py) adapts MegaMoE's kernel ABI to
+kern's device peer table (and refuses a DeepGEMM source it has not
+reviewed), and [`patch_fused.py`](source/attention/patch_fused.py) broadens
+two static assertions in FlashMLA's fused core for NVCC 13, changing no
+arithmetic, memory access or control flow. The sources
 under [`source/`](source/) are kern's, Apache-2.0 ([`source/LICENSE`](source/LICENSE)).
