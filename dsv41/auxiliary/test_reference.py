@@ -223,7 +223,8 @@ def main():
         pos=torch.arange(151,156,device="cuda",dtype=torch.int32) if noncausal else torch.arange(count,device="cuda",dtype=torch.int32)
         end=torch.full((count,),156,device="cuda",dtype=torch.int32)
         out=torch.empty(count,width,device="cuda",dtype=torch.int32)
-        launch("window_indices",(count,1,1),out,req,pos,end,pages3,count,128,width,16,32,noncausal,5)
+        lengths=torch.clamp(pos+1,max=128)
+        launch("window_indices",(count,1,1),out,req,pos,end,lengths,pages3,count,128,width,16,32,noncausal,5)
         if not noncausal:
             ref=ns["get_window_topk_idxs"](128,1,count,0)[0].cuda()
             assert torch.equal(out[:,:count],ref)

@@ -7,14 +7,16 @@ from .forward import Lowered
 class CompressedAttention:
     def __init__(self, pieces, serving, layouts, *, mode, capacity, pool_tokens,
                  cos_sin, cubin_dir, auxiliary_cubin, dense_cubin, sparse_cubin,
-                 select_cubin, candidate_cubin):
+                 select_cubin, candidate_cubin, source=None):
         self.pieces, self.serving, self.layouts = pieces, serving, layouts
         self.mode, self.capacity = mode, capacity
         self.pool_tokens, self.cos_sin = pool_tokens, cos_sin
         self.cubin_dir, self.auxiliary_cubin = cubin_dir, auxiliary_cubin
         self.index_cubins = dict(dense_cubin=dense_cubin,sparse_cubin=sparse_cubin,
                                  select_cubin=select_cubin,candidate_cubin=candidate_cubin)
-        self.source = None
+        # A source an earlier stage published (the encoder's projection of the
+        # decoder's global KV, ahead of a replay) is read, never republished.
+        self.source = source
         self.indices = None
         self.candidates = None
         self.commits = []
@@ -24,7 +26,7 @@ class CompressedAttention:
         if layer < 2:
             raise ValueError("window-only layers have no compressed branch")
         buffers, calls = {}, []
-        if layer in dict(self.serving.layout.sources):
+        if layer in dict(self.serving.layout.sources) and layer != self.source:
             self.source = layer
             published = publish(self.pieces,self.serving,layer,hidden,mode=self.mode,
                                 capacity=self.capacity,cos_sin=self.cos_sin,

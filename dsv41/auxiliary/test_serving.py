@@ -62,14 +62,15 @@ def main():
         ring,lines=256,tensor([5,2,9][:seqs])
         wslot=alloc(rows,torch.int64)
         starts,live,ends,ids32,counts = alloc(seqs+1,torch.int32),alloc(seqs,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(seqs,torch.int32)
-        winlen,complen=alloc(rows,torch.int32),alloc(rows,torch.int32)
-        launch("dsv41_metadata",(rows+255)//256,req,pos,slot,wslot,mask,starts,live,ends,ids32,counts,winlen,complen,
-            src_pos,src_slots,src_valid,ids,cu_in,lens,lines,rows,seqs,draft,ring)
+        winlen,complen,source=alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int32)
+        launch("dsv41_metadata",(rows+255)//256,req,pos,slot,wslot,mask,starts,live,ends,ids32,counts,winlen,complen,source,
+            src_pos,src_slots,src_valid,ids,cu_in,lens,lines,rows,seqs,draft,ring,0)
         selection = [starts_in[s]+j for s in range(seqs) for j in range(5)] if draft else list(range(rows))
         expected_pos = tensor([positions[i] for i in selection])
         expected_valid = tensor([valid[i] for i in selection],torch.uint8)
         expected_slot = tensor([slots[i] if valid[i] else -1 for i in selection],torch.int64)
         assert torch.equal(pos,expected_pos) and torch.equal(slot,expected_slot) and torch.equal(mask,expected_valid)
+        assert torch.equal(source,tensor(selection))
         assert torch.equal(wslot,torch.where(mask.bool(),lines[req.long()].long()*ring+pos%ring,-1))
         assert torch.equal(ids32,ids.int())
         assert torch.equal(winlen,torch.where(mask.bool(),torch.minimum(ends if draft else pos+1,torch.full_like(pos,133 if draft else 128)),0))
@@ -83,7 +84,7 @@ def main():
         page_table=torch.arange(seqs*page_cols,device="cuda",dtype=torch.int32).reshape(seqs,page_cols)+37
         if draft and reference_topk:
             window=alloc((rows,192),torch.int32)
-            launch("dsv41_window_indices",rows,window,req,pos,ends,lines,rows,128,192,ring,1,5)
+            launch("dsv41_window_indices",rows,window,req,pos,ends,winlen,lines,rows,128,192,ring,1,5)
             for row in range(rows):
                 seq=int(req[row]);anchor=bases[seq]
                 if not active[seq] or anchor<=1:continue
@@ -101,17 +102,17 @@ def main():
         for ratio in (1,2):
             query_pages=torch.full((rows,page_cols),-999,device="cuda",dtype=torch.int32)
             compressed_end=alloc(rows,torch.int32)
-            request_ids,sparse_ends=alloc(rows,torch.int32),alloc(rows,torch.int32)
-            launch("dsv41_index_metadata",rows,query_pages,compressed_end,request_ids,sparse_ends,req,pos,mask,page_table,
-                   rows,page_cols,128//ratio,ratio)
+            request_ids,runs,sparse_ends=alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int32)
+            launch("dsv41_index_metadata",rows,query_pages,compressed_end,request_ids,runs,sparse_ends,req,pos,mask,page_table,
+                   rows,page_cols,ratio)
             assert torch.equal(request_ids,torch.arange(rows,device="cuda",dtype=torch.int32))
+            block=torch.arange(rows,device="cuda")//128
+            split=(req[1:]!=req[:-1])|(block[1:]!=block[:-1])
+            assert torch.equal(split,runs[1:]!=runs[:-1])
             assert torch.equal(sparse_ends,torch.where(mask.bool(),16384,0).int())
             expected_end=torch.where(mask.bool(),(pos+1)//ratio,0)
             assert torch.equal(compressed_end,expected_end)
-            used=(expected_end+128//ratio-1)//(128//ratio)
-            expected_pages=torch.where(torch.arange(page_cols,device="cuda")[None,:]<used[:,None],
-                                       page_table[req.long()],0)
-            assert torch.equal(query_pages,expected_pages)
+            assert torch.equal(query_pages,page_table[req.long()])
         cslot,cpos=alloc(rows,torch.int64),alloc(rows,torch.int32)
         launch("dsv41_compressed_metadata",(rows+255)//256,cslot,cpos,slot,pos,mask,rows,2)
         complete=mask.bool() & ((pos+1)%2==0)

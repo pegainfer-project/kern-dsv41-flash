@@ -3,7 +3,10 @@
 The caller merges vars/buffers/states/modules/ops into its manifest and appends
 these ordinary call lists to its model stages. No program calls another program.
 The host stages six rows for a speculative round; draft selects rows0..4, while
-verify consumes all six. `fill: valid` is required: padding leases are real
+verify consumes all six. With `Layout.replay`, prefill ends at the encoder and
+the decoder layers run in `replay` mode: each sequence's last `replay` rows,
+front-padded, their window bounded at the first replayed row (SWA Bounded
+Replay, V4.1 report 3.2.2). `fill: valid` is required: padding leases are real
 addresses and token0 cannot be treated as a padding sentinel.
 """
 from dataclasses import dataclass
@@ -42,6 +45,7 @@ class Layout:
     target_layers: int = 40
     draft_layers: int = 3
     sources: tuple = ((2, 2), (8, 2), (14, 2), (20, 1))
+    replay: int = 0
 
     def __post_init__(self):
         if self.max_seqs < 1 or self.max_tokens < 6 * self.max_seqs:
@@ -52,6 +56,8 @@ class Layout:
             raise ValueError("context bound must be a whole number of pages")
         if any(r not in (1, 2) for _, r in self.sources):
             raise ValueError("only ratio1 and ratio2 compressors are supported")
+        if self.replay and (self.replay < 133 or self.replay * self.max_seqs > self.max_tokens):
+            raise ValueError("a replay covers the 128-token window and DSpark's 133, within the tokens bound")
 
     @property
     def pages(self):
@@ -74,11 +80,8 @@ class Serving:
     modules: dict
     ops: dict
 
-    @staticmethod
-    def rows(mode):
-        if mode not in ("prefill", "decode", "verify", "draft"):
-            raise ValueError(mode)
-        return {"mul": ["seqs", 5]} if mode == "draft" else "tokens"
+    def rows(self, mode):
+        return mode_rows(mode, self.layout.replay)
 
     def _call(self, mode, label, op, *args):
         return call(f"{mode}.{label}", f"{mode}.{op}", *args)
@@ -112,10 +115,11 @@ class Serving:
         ids is staged input_ids for plain, verify_ids or draft_ids for the round.
         """
         rows = scalar(self.rows(mode))
-        names = ("request", "position", "slot", "window_slot", "mask", "starts", "seq_valid", "block_end", "ids32", "all_count", "window_length", "compressed_length")
+        names = ("request", "position", "slot", "window_slot", "mask", "starts", "seq_valid", "block_end", "ids32", "all_count", "window_length", "compressed_length", "source_rows")
+        phase = {"draft": 1, "replay": 2}.get(mode, 0)
         calls = [self._call(mode, "metadata", "metadata", *(buf(f"{mode}.{n}") for n in names),
             buf("positions"), buf("slot_mapping"), buf("valid"), buf(ids), buf("cu_seqlens"), buf("seq_lens"),
-            buf("window.lines"), rows, scalar("seqs"), scalar(int(mode == "draft")), scalar(self.layout.ring))]
+            buf("window.lines"), rows, scalar("seqs"), scalar(phase), scalar(self.layout.ring), scalar(self.layout.replay))]
         if mode != "draft":
             calls += [self._call(mode, f"compressed{ratio}", "compressed_metadata",
                 buf(f"{mode}.c{ratio}_slot"), buf(f"{mode}.c{ratio}_position"),
@@ -123,7 +127,8 @@ class Serving:
                 for ratio in (1, 2)]
         width = 192 if mode == "draft" else 128
         calls += [self._call(mode, "window_indices", "window_indices", buf(f"{mode}.window_indices"),
-            buf(f"{mode}.request"), buf(f"{mode}.position"), buf(f"{mode}.block_end"), buf("window.lines"),
+            buf(f"{mode}.request"), buf(f"{mode}.position"), buf(f"{mode}.block_end"),
+            buf(f"{mode}.window_length"), buf("window.lines"),
             rows, scalar(128), scalar(width), scalar(self.layout.ring), scalar(int(mode == "draft")), scalar(5)),
             self._call(mode, "window_mask", "indices_mask", buf(f"{mode}.window_indices"),
                 buf(f"{mode}.mask"), rows, scalar(width))]
@@ -196,17 +201,17 @@ class Serving:
         """Query-local page table and causal end for paged dense scoring.
 
         Reuse these buffers among sources with the same compression ratio.
-        Call after prepare; valid0 rows have end0 and an all-zero page table.
+        Call after prepare; every row has its sequence's page row, valid0
+        rows have end0, and runs split each sequence at 128-row blocks.
         """
         if mode == "draft":
             raise ValueError("draft layers have no compressed indexer")
         ratio = dict(self.layout.sources)[source]
         return [self._call(mode, f"index{source}.metadata", "index_metadata",
             buf(f"{mode}.c{ratio}_page_table"), buf(f"{mode}.c{ratio}_end"),
-            buf(f"{mode}.index_request_ids"), buf(f"{mode}.sparse_ends"),
+            buf(f"{mode}.index_request_ids"), buf(f"{mode}.index_runs"), buf(f"{mode}.sparse_ends"),
             buf(f"{mode}.request"), buf(f"{mode}.position"), buf(f"{mode}.mask"),
-            buf("page_table"), scalar(self.rows(mode)), scalar(self.layout.pages),
-            scalar(self.layout.page_size // ratio), scalar(ratio))]
+            buf("page_table"), scalar(self.rows(mode)), scalar(self.layout.pages), scalar(ratio))]
 
     def index_write(self, mode, source, packed_key, key_scales):
         """Packed[page,64], E8M0[page,4], then pad page stride to512 bytes."""
@@ -238,6 +243,13 @@ class Serving:
             self._call(mode, f"compress{source}.commit", "compressor_commit", state(f"compressor.{source}"),
                 buf(projected_kv), buf(projected_score), buf(f"compressor.{source}.lines"),
                 buf(f"{mode}.starts"), buf(f"{mode}.commit_count"), scalar("seqs"), scalar(512), scalar(1))]
+
+
+def mode_rows(mode, replay=0):
+    """The rows a mode's call runs: as fed, five draft rows a sequence, or a replay's rows."""
+    if mode not in ("prefill", "decode", "verify", "draft", "replay") or (mode == "replay" and not replay):
+        raise ValueError(mode)
+    return {"mul": ["seqs", 5]} if mode == "draft" else {"mul": ["seqs", replay]} if mode == "replay" else "tokens"
 
 
 def rope_name(compress_ratio, *, split=False):
@@ -278,8 +290,8 @@ def build(cubin: Path, layout=Layout(), peers=None):
             buffers[f"compressor.{source}.lines"] = {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                 "domain": {"index_into": f"compressor.{source}", "stride": 4096}}
     modules, all_ops = {}, {}
-    for mode in ("prefill", "decode", "verify", "draft"):
-        rows = Serving.rows(mode)
+    for mode in ("prefill", "decode", "verify", "draft") + (("replay",) if layout.replay else ()):
+        rows = mode_rows(mode, layout.replay)
         mods, ops = definitions(cubin, rows=rows, groups=rows, seqs="seqs", peers=peers)
         modules.update(mods)
         all_ops.update({f"{mode}.{name}": op for name, op in ops.items()})
@@ -287,12 +299,12 @@ def build(cubin: Path, layout=Layout(), peers=None):
             "slot": ("i64", ["tokens"]), "window_slot": ("i64", ["tokens"]), "mask": ("u8", ["tokens"]), "starts": ("i32", [layout.max_seqs + 1]),
             "seq_valid": ("i32", ["seqs"]), "block_end": ("i32", ["tokens"]), "ids32": ("i32", ["tokens"]),
             "window_length": ("i32", ["tokens"]), "compressed_length": ("i32", ["tokens"]),
-            "all_count": ("i32", ["seqs"]), "commit_count": ("i32", ["seqs"]),
+            "all_count": ("i32", ["seqs"]), "commit_count": ("i32", ["seqs"]), "source_rows": ("i32", ["tokens"]),
             "window_indices": ("i32", ["tokens", 192 if mode == "draft" else 128])}
         if mode != "draft":
             shapes.update({"hashes": ("i64", ["tokens", 2, 24]), "pool_kv": ("f32", ["tokens", 2, 512]),
                 "pool_score": ("f32", ["tokens", 2, 512]), "pool_valid": ("i32", ["tokens"]),
-                "index_request_ids": ("i32", ["tokens"]), "sparse_ends": ("i32", ["tokens"])})
+                "index_request_ids": ("i32", ["tokens"]), "index_runs": ("i32", ["tokens"]), "sparse_ends": ("i32", ["tokens"])})
             for ratio in (1, 2):
                 shapes[f"c{ratio}_page_table"] = ("i32", ["tokens", layout.pages])
                 shapes[f"c{ratio}_end"] = ("i32", ["tokens"])

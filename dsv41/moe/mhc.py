@@ -6,7 +6,9 @@ y_bf16, token_count, split_barriers, then the MXFP8 copy of the normalized
 output: `fp8="gemm"` adds y_fp8 and column-major GEMM scales
 [hidden/128, align4(capacity)]; `fp8="moe"` adds y_fp8, row-major routed
 scales [tokens, hidden/128] and the Mega MoE shared-expert scale pages whose
-word stride is `shared_rows`, all three as raw slab regions (u8). FP8 is derived from the rounded BF16, the same
+word stride is `shared_rows`, all three as raw slab regions (u8). The pages
+follow the block M of the MegaMoE launch that reads them: `blocks` holds the
+MoE's `(block_m, first, last)` runs of rows, and each run gets its launch. FP8 is derived from the rounded BF16, the same
 boundary as the standalone quantization kernels. All token dimensions are
 flattened. The barriers are a caller-owned buffer zeroed once at load; the
 kernel initializes and leaves them consistent per call, as upstream does
@@ -15,16 +17,22 @@ with one per-stream allocation.
 from pathlib import Path
 import hashlib
 
+from .when import gated, meet
+
 SPLITS=40  # upstream's pick for <=3 m-blocks on 152 SMs; 16 is its deterministic-mode default
+# Upstream's split count by row count: one task per SM while few m-blocks
+# share them, its default 16 from eight 64-row m-blocks on.
+def split_runs(capacity): return [(SPLITS,1,min(448,capacity))]+([(16,449,capacity)] if capacity>448 else [])
 # The kernel is persistent and its split reduction barriers over every CTA, so
 # the SM count is a template parameter and the grid is the device's SM count:
 # an instance built for more SMs than the device has waits for CTAs that never
 # become resident. The cubin carries one per device (GB300 152, B300 148).
 SCRATCH_PER_TASK=6656  # layout::mega_mhc::Workspace::get_num_scratch_bytes(1,1)
 
-def pieces(rows='tokens', cubin_dir=None, max_tokens=8192, *, fp8, shared_rows=None, splits=SPLITS, device_sms=152):
-    if fp8 not in ('gemm','moe') or (fp8 == 'moe') != (shared_rows is not None):
-        raise ValueError('fp8 output is gemm, or moe with the shared scale rows')
+def pieces(rows='tokens', cubin_dir=None, max_tokens=8192, *, fp8, shared_rows=None, blocks=None, live=None, splits=None, device_sms=152):
+    """`rows` is the capacity the tensor maps describe; `live` the rows a call runs, which picks the instance."""
+    if fp8 not in ('gemm','moe') or (fp8 == 'moe') != (shared_rows is not None) or (fp8 == 'moe') != (blocks is not None):
+        raise ValueError('fp8 output is gemm, or moe with the shared scale rows and block M runs')
     root=Path(cubin_dir) if cubin_dir else Path(__file__).resolve().parents[2]/'build'
     modules={name:{'source':str((Path(cubin_dir) if cubin_dir else Path('build'))/file),'sha256':hashlib.sha256((root/file).read_bytes()).hexdigest()} for name,file in [('dsv41_mhc','dsv41_mhc.cubin'),('dsv41_moe_boundary','dsv41_moe_boundary.cubin')]}
     capacity=rows if isinstance(rows,int) else max_tokens
@@ -41,6 +49,11 @@ def pieces(rows='tokens', cubin_dir=None, max_tokens=8192, *, fp8, shared_rows=N
     strides=[1,(capacity+3)//4*4,0] if fp8 == 'gemm' else [5120//128,1,shared_rows]
     norm=pack(88,[pointer(0,14),pointer(8,8),pointer(16,9),{'at':24,'f32':1e-20},{'at':28,'f32':1.},pointer(32,13),pointer(40,16),pointer(48,17),{'at':56,'i64':strides[0]},{'at':64,'i64':strides[1]}]+([pointer(72,18),{'at':80,'i64':strides[2]}] if fp8 == 'moe' else []))
     args=[residual(1),hidden(0),tm(5,'tf32',[5120,24,4],[81920,20480],[32,24,4]),coeff(2,4,0),coeff(3,16,64),coeff(4,4,0),residual(9),hidden(13),mix,norm,{'scratch':'partials'},{'param':15}]
-    entry=f"_ZN9deep_gemm19sm100_mega_mhc_implILj5120ELj{splits}ELj{device_sms}ELb1ELb1ELb1ELj{0 if fp8 == 'gemm' else 16}EEEv14CUtensorMap_stS1_S1_S1_S1_S1_S1_S1_NS_6layout8mega_mhc7MixArgsENS3_8NormArgsEPvPm"
-    op={'params':params,'impl':{'scratch':{'partials':{'dtype':'u8','shape':[((max_tokens+63)//64)*splits*SCRATCH_PER_TASK]}},'launches':[{'module':'dsv41_mhc','entry':entry,'params':['bytes<128>']*8+['bytes<64>','bytes<88>','out buffer<u8>','inout buffer<u64>'],'args':args,'block':[768,1,1],'grid':[device_sms,1,1],'shared_mem':227328,'pdl':True}]}}
+    entry=lambda b,s:f"_ZN9deep_gemm19sm100_mega_mhc_implILj5120ELj{s}ELj{device_sms}ELb1ELb1ELb1ELj{b}EEEv14CUtensorMap_stS1_S1_S1_S1_S1_S1_S1_NS_6layout8mega_mhc7MixArgsENS3_8NormArgsEPvPm"
+    runs=meet(blocks or [(0,1,capacity)],[(splits,1,capacity)] if splits else split_runs(capacity))
+    def launch(bs,when):
+        l={'module':'dsv41_mhc','entry':entry(*bs),'params':['bytes<128>']*8+['bytes<64>','bytes<88>','out buffer<u8>','inout buffer<u64>'],'args':args,'block':[768,1,1],'grid':[device_sms,1,1],'shared_mem':227328,'pdl':True}
+        return {**l,'when':when} if when else l
+    most=max(s for (_,s),_,_ in runs)
+    op={'params':params,'impl':{'scratch':{'partials':{'dtype':'u8','shape':[((max_tokens+63)//64)*most*SCRATCH_PER_TASK]}},'launches':[launch(bs,when) for bs,when in gated(live if live is not None else capacity,runs)]}}
     return modules,{'dsv41_mhc':op}

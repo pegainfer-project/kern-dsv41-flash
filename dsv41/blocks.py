@@ -23,13 +23,13 @@ class Blocks:
         self.boundary = pieces.add(boundary.pieces(rows, cubin_dir))
         self.pieces, self.cubin_dir, self.device_sms = pieces, cubin_dir, device_sms
 
-    def mhc(self, fp8, shared_rows=None):
+    def mhc(self, fp8, shared_rows=None, blocks=None):
         """The mHC op storing its normalized output for one consumer kind.
 
         TMA describes allocated capacity; token_count controls live rows.
         """
         return self.pieces.add(mhc.pieces(self.capacity, self.cubin_dir, max_tokens=self.capacity,
-                                          fp8=fp8, shared_rows=shared_rows,
+                                          fp8=fp8, shared_rows=shared_rows, blocks=blocks, live=self.rows,
                                           device_sms=self.device_sms))["dsv41_mhc"]
 
     def name(self, suffix):
@@ -45,12 +45,16 @@ class Blocks:
         return {self.name(n): {"dtype": dtype, "shape": [self.capacity,width], "kind":"workspace"}
                 for n,(dtype,width) in shapes.items()}
 
+    def identity(self):
+        """The identity mixes a materialized stream resets to."""
+        post, comb, pre = (self.name(n) for n in ("post0","comb0","pre0"))
+        return [call(self.name("identity"), self.boundary["dsv41_hc_identity"],
+                     buf(post),buf(comb),buf(pre),scalar(self.rows))]
+
     def initialize(self, embedding):
         post, comb, pre = (self.name(n) for n in ("post0","comb0","pre0"))
         residual = self.name("materialized")
-        calls = [
-            call(self.name("identity"), self.boundary["dsv41_hc_identity"],
-                 buf(post),buf(comb),buf(pre),scalar(self.rows)),
+        calls = self.identity() + [
             call(self.name("expand"), self.boundary["dsv41_hc_init"],
                  buf(residual),buf(embedding),scalar(self.rows)),
         ]
@@ -77,7 +81,7 @@ class Blocks:
 
         The normalized rows go out as BF16 and as the consumer's MXFP8 input:
         `fp8` is (q, sf) buffer names for attention, or (slab regions,
-        shared_rows) for the MoE. Return pending state whose update is
+        shared_rows, block M runs) for the MoE. Return pending state whose update is
         produced by the following attention or MoE calls. The caller appends
         those calls before consuming this state.
         """
@@ -90,8 +94,8 @@ class Blocks:
         if kind == "attn":
             op, outputs = self.mhc("gemm"), [buf(name) for name in fp8]
         else:
-            regions, shared_rows = fp8
-            op, outputs = self.mhc("moe", shared_rows), list(regions)
+            regions, shared_rows, blocks = fp8
+            op, outputs = self.mhc("moe", shared_rows, blocks), list(regions)
         calls = [call(f"{self.prefix}.{layer}.{kind}.mhc",op,
                       buf(state.update),buf(state.residual),buf(state.post),buf(state.comb),buf(state.pre),
                       buf(f"{layer}.hc_{kind}_fn"),buf(f"{layer}.hc_{kind}_scale"),

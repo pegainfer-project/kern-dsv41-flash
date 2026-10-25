@@ -75,7 +75,7 @@ def assemble(stages, *, max_seqs, block_size=5, noise_token=128799):
     return {
         "load": {"once": True, "calls": stages.load},
         "prefill": {
-            "batch": {"groups": 1, "rows": "tokens"},
+            "batch": {"groups": max_seqs, "rows": "tokens"},
             "calls": stages.prefill + prefixed("context", stages.prefill_context),
         },
         "decode_batch": {

@@ -193,7 +193,7 @@ def quantized_projection(pieces,label,layout,source,scales,output,*,rows,capacit
     n,k,groups=(layout[key] for key in ("n","k","groups"))
     if groups!=1:
         raise ValueError("unsupported grouped projection")
-    name=pieces.add(dense.pieces(capacity,n,k,sfa_rows=align4(capacity),
+    name=pieces.add(dense.pieces(capacity,n,k,live=rows,sfa_rows=align4(capacity),
                                  sfb_rows=layout.get("columns"),cubin_dir=cubin_dir))["dsv41_dense"]
     return Lowered({output:{"dtype":"bf16","kind":"workspace","shape":[capacity,n]}},
                    [call(label,name,buf(output),buf(source),
@@ -211,7 +211,7 @@ def output_projection(pieces,label,layout,source,scales,output,*,rows,capacity,c
     n,k,groups=(layout[key] for key in ("n","k","groups"))
     if (n,k,groups)!=(1024,4096,8):
         raise ValueError("the O-A instance requires eight 1024x4096 matrices")
-    name=pieces.add(dense.oa_pieces(capacity,sfa_rows=align4(capacity),cubin_dir=cubin_dir))["dsv41_oa"]
+    name=pieces.add(dense.oa_pieces(capacity,live=rows,sfa_rows=align4(capacity),cubin_dir=cubin_dir))["dsv41_oa"]
     sf=output+".sf"
     buffers={output:{"dtype":"fp8e4m3","kind":"workspace","shape":[capacity,n*groups]},
              sf:{"dtype":"i32","kind":"workspace","shape":[n*groups//128,align4(capacity)]}}

@@ -6,19 +6,18 @@ from .moe import gate, moe
 from .programs import buf, call, integer
 
 
-def fp8_input(workspace, *, experts=384, cubin_dir=None, rows="tokens", device_sms=152):
-    """Where Mega mHC stores the MoE input: slab regions for FP8 x, routed and shared scales."""
-    _, _, geometry = moe.pieces(experts, cubin_dir, rows, device_sms)
+def fp8_input(workspace, *, capacity, experts=384, cubin_dir=None, rows="tokens", device_sms=152):
+    """Where Mega mHC stores the MoE input: slab regions for FP8 x, routed and shared scales,
+    and the MegaMoE block M runs of rows, which page the shared scales."""
+    _, _, geometry = moe.pieces(experts, cubin_dir, rows, device_sms, capacity)
     slab = f"{workspace}.e{experts}.slab"
     regions = [offset(slab, geometry["offsets"][name]) for name in ("x", "x_sf", "shared_x_sf")]
-    return regions, geometry["shared_sf_rows"]
+    return regions, geometry["shared_sf_rows"], moe.segments(experts, capacity)
 
 
 def forward(pieces, layer, layouts, source, output, *, rows, capacity,
             workspace, experts=384, cubin_dir=None, device_sms=152):
-    if capacity > 8192 or capacity < 1:
-        raise ValueError("MegaMoE slab supports 1..8192 local rows")
-    modules, ops, geometry = moe.pieces(experts, cubin_dir, rows, device_sms)
+    modules, ops, geometry = moe.pieces(experts, cubin_dir, rows, device_sms, capacity)
     names = pieces.add((modules,ops))
     gate_name = f"dsv41_gate_e{experts}"
     gates = pieces.add(gate.pieces(

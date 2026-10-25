@@ -41,7 +41,7 @@ def generate(raw, *, cubin_dir, auxiliary_cubin, attention_cubin, capacity=128, 
                    workspace=mode+".moe",cubin_dir=cubin_dir,device_sms=device_sms)
     state,lowered = blocks.layer(state,layer,attn,ffn,
                                  attention_fp8=fp8_input(mode+".attn",capacity)[1],
-                                 ffn_fp8=moe_fp8_input(mode+".moe",cubin_dir=cubin_dir,rows="tokens",device_sms=device_sms))
+                                 ffn_fp8=moe_fp8_input(mode+".moe",capacity=capacity,cubin_dir=cubin_dir,rows="tokens",device_sms=device_sms))
     state,finish = blocks.materialize(state,mode+".finish")
     programs = {
         "load":{"once":True,"calls":dense_load+expert_load+barrier_load},

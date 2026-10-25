@@ -1,6 +1,7 @@
 // Unmodified DeepGEMM MXFP8 GEMMs; dynamic M/N/K, row-major operands. The dense
 // instance returns BF16; O-A returns MXFP8 for WO_B to consume unchanged.
-// One instance per tile config in dense.py CONFIGS (block_m, block_n, stages);
+// One instance per tile config in dense.py CONFIGS (block_m, block_n, stages),
+// the 128-row blocks for prefill rows;
 // the generator names the instance it wants by its mangled template arguments.
 // The C/D swizzle is one store-block row: min(128, block_n * sizeof(out)).
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
@@ -19,6 +20,8 @@ void instantiate_dsv41_dense(){
   DSV41_DENSE(64,64,128,12)
   DSV41_DENSE(64,128,128,8)
   DSV41_DENSE(64,256,128,5)
+  DSV41_DENSE(128,128,128,5)
+  DSV41_DENSE(128,256,128,3)
 }
 void instantiate_dsv41_oa(){
   DSV41_OA(64,128,128,4)
@@ -30,4 +33,6 @@ void instantiate_dsv41_oa(){
   DSV41_OA(64,64,64,12)
   DSV41_OA(64,128,128,8)
   DSV41_OA(64,256,128,5)
+  DSV41_OA(128,128,128,5)
+  DSV41_OA(128,256,128,3)
 }

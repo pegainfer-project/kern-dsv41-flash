@@ -3,9 +3,9 @@
 #include <cuda_bf16.h>
 using namespace deep_gemm;
 static void __instantiate_kernel() {
-    auto meta=reinterpret_cast<void*>(&sched::sm100_paged_mqa_logits_metadata<1,false,false,256,148>);
-    auto p64=reinterpret_cast<void*>(&sm100_paged_mqa_logits<1,32,128,64,true,false,false,3,10,256,16,128,256,cutlass::float_e2m1_t,float,float>);
-    auto p128=reinterpret_cast<void*>(&sm100_paged_mqa_logits<1,32,128,128,true,false,false,3,10,256,16,128,256,cutlass::float_e2m1_t,float,float>);
+    auto meta=reinterpret_cast<void*>(&sched::sm100_paged_mqa_logits_metadata<1,false,true,256,148>);
+    auto p64=reinterpret_cast<void*>(&sm100_paged_mqa_logits<1,32,128,64,true,false,true,3,10,256,16,128,256,cutlass::float_e2m1_t,float,float>);
+    auto p128=reinterpret_cast<void*>(&sm100_paged_mqa_logits<1,32,128,128,true,false,true,3,10,256,16,128,256,cutlass::float_e2m1_t,float,float>);
 }
 extern "C" __global__ void dsv41_dense_initialize(float* scores,int rows,int width){
     long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;

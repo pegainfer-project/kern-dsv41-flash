@@ -11,7 +11,7 @@ def main():
     p.add_argument('--page',type=int,default=64);p.add_argument('--check',action='store_true');a=p.parse_args()
     import torch
     sys.path.insert(0,str(Path(__file__).resolve().parents[2]));from dsv41.schema import SCHEMA_VERSION
-    from paged_indexer_ops import definitions
+    from paged_indexer_ops import definitions, weights
     reports=[]
     for rows in (4,12,32):
         keys=512;page=a.page;pages=keys//page;stride=((page*68+511)//512)*512
@@ -34,13 +34,14 @@ def main():
         cache=torch.zeros((pages,stride),dtype=torch.uint8);cache[:,:page*68]=torch.cat([kp[perm],ks[perm]],dim=1)
         table=perm.argsort().int()[None].repeat(rows,1)
         projection=(read('weights',torch.float32)*64).bfloat16().reshape(rows,32)
-        for n,t in [('cache',cache),('table',table),('projection',projection)]:
+        for n,t in [('cache',cache),('table',table),('request',torch.zeros(rows,dtype=torch.int32)),('projection',projection)]:
             (root/f'{n}.bin').write_bytes(t.contiguous().view(torch.uint8).numpy().tobytes())
         for n in ('q','qs','weights','end'):(root/f'{n}.bin').write_bytes((source/f'{n}.bin').read_bytes())
-        modules,ops=definitions(a.artifacts/'paged_indexer.cubin',rows='rows',rows_max=rows,kv_rows_max=keys,page_size=page,pages=pages,page_cols=pages,cache_state=False)
-        specs=[('q','u8',[rows,32,64]),('qs','fp8e8m0',[rows,32,4]),('weights','f32',[rows,32]),('end','i32',[rows]),('table','i32',[rows,pages]),('cache','u8',[pages,stride]),('out','f32',[rows,keys]),('projection','bf16',[rows,32]),('weight_bf16','bf16',[rows,32]),('weight_f32','f32',[rows,32])]
+        modules,ops=definitions(a.artifacts/'paged_indexer.cubin',rows='rows',rows_max=rows,kv_rows_max=keys,page_size=page,pages=pages,page_cols=pages,cache_state=False,clean=True)
+        ops={**ops,**weights(a.artifacts/'paged_indexer.cubin',rows='rows')[1]}
+        specs=[('q','u8',[rows,32,64]),('qs','fp8e8m0',[rows,32,4]),('weights','f32',[rows,32]),('end','i32',[rows]),('table','i32',[rows,pages]),('request','i32',[rows]),('cache','u8',[pages,stride]),('out','f32',[rows,keys]),('projection','bf16',[rows,32]),('weight_bf16','bf16',[rows,32]),('weight_f32','f32',[rows,32])]
         buffers={n:{'kind':'output' if n in ('out','weight_bf16','weight_f32') else 'input','dtype':d,'shape':sh} for n,d,sh in specs}
-        calls=[{'op':'dsv41_paged_index_scores','args':[{'buf':n} for n in ('q','qs','weights','end','table','cache')]+[{'buf':'cache','offset':page*64},{'buf':'out'},{'var':'rows'}]},
+        calls=[{'op':'dsv41_paged_index_scores','args':[{'buf':n} for n in ('q','qs','weights','end','table','request','cache')]+[{'buf':'cache','offset':page*64},{'buf':'out'},{'var':'rows'}]},
                {'op':'dsv41_index_weights','args':[{'buf':n} for n in ('projection','weight_bf16','weight_f32')]+[{'var':'rows'}]}]
         m={'schema_version':SCHEMA_VERSION,'model':'paged-dense-indexer-probe','vars':{'rows':{'max':rows}},'states':{},'buffers':buffers,'modules':modules,'ops':ops,'programs':{'probe':{'calls':calls}}}
         (root/'manifest.json').write_text(json.dumps(m,indent=2))

@@ -133,11 +133,13 @@ extern "C" __global__ void dsv41_compressor_gather(float* kv,float* score,int32_
 // modulo ring inside it. The slot is the sequence's window line.
 __device__ int64_t ring_slot(const int32_t* lines,int seq,int position,int ring){return (int64_t)lines[seq]*ring+position%ring;}
 // Logical causal window indices. Each query receives exactly window entries;
-// invalid prefix entries are -1. DSpark extends visibility to block_end[row].
-extern "C" __global__ void dsv41_window_indices(int32_t* out,const int32_t* req,const int32_t* pos,const int32_t* block_end,const int32_t* lines,int rows,int window,int width,int ring,int noncausal,int draft_rows){
+// invalid prefix entries are -1. A causal query sees the `lengths[row]` keys
+// ending at its own position (the metadata's window length, which a replay
+// bounds at its first replayed row); DSpark extends visibility to block_end[row].
+extern "C" __global__ void dsv41_window_indices(int32_t* out,const int32_t* req,const int32_t* pos,const int32_t* block_end,const int32_t* lengths,const int32_t* lines,int rows,int window,int width,int ring,int noncausal,int draft_rows){
   pdl();
  int row=blockIdx.x;int end=noncausal?block_end[row]:pos[row]+1;
- int start=max(0,noncausal?end-window-draft_rows:pos[row]-window+1);int count=end-start;
+ int start=noncausal?max(0,end-window-draft_rows):end-lengths[row];int count=end-start;
  for(int i=threadIdx.x;i<width;i+=256)out[(int64_t)row*width+i]=(i<count)?(int32_t)ring_slot(lines,req[row],start+i,ring):-1;
 }
 extern "C" __global__ void dsv41_map_indices(int32_t* out,const int32_t* logical,const int32_t* req,const int32_t* pos,const int32_t* pages,int rows,int topk,int ratio,int page_size,int page_stride){
@@ -238,18 +240,22 @@ extern "C" __global__ void dsv41_compressor_commit(float* state,const float* kv,
  for(int d=threadIdx.x;d<dim;d+=256){state[base+d]=kv[(int64_t)row*dim+d];state[base+dim+d]=score[(int64_t)row*dim+d];}
 }
 // Generic serving metadata. phase0 preserves staged rows; phase1 selects the
-// five draft rows starting at each six-row verification anchor. `valid` is a caller
-// fill; token IDs and leased padding addresses cannot reveal padded rows.
-extern "C" __global__ void dsv41_metadata(int32_t* req,int32_t* pos,int64_t* slots,int64_t* window_slots,uint8_t* mask,int32_t* starts,int32_t* seq_valid,int32_t* ends,int32_t* ids32,int32_t* counts,int32_t* window_length,int32_t* compressed_length,const int32_t* input_pos,const int64_t* input_slots,const int32_t* valid,const int64_t* ids,const int32_t* cu,const int32_t* seq_lens,const int32_t* window_lines,int rows,int seqs,int phase,int ring){
+// five draft rows starting at each six-row verification anchor; phase2 replays
+// the last `keep` rows of each sequence, front-padded so a sequence's last
+// replay row is its last token, its window bounded at its first replayed row.
+// `valid` is a caller fill; token IDs and leased padding addresses cannot
+// reveal padded rows. source_rows[row] is the staged row each row reads.
+extern "C" __global__ void dsv41_metadata(int32_t* req,int32_t* pos,int64_t* slots,int64_t* window_slots,uint8_t* mask,int32_t* starts,int32_t* seq_valid,int32_t* ends,int32_t* ids32,int32_t* counts,int32_t* window_length,int32_t* compressed_length,int32_t* source_rows,const int32_t* input_pos,const int64_t* input_slots,const int32_t* valid,const int64_t* ids,const int32_t* cu,const int32_t* seq_lens,const int32_t* window_lines,int rows,int seqs,int phase,int ring,int keep){
   pdl();
  int row=blockIdx.x*256+threadIdx.x;
- if(row<rows){int seq,source;
- if(phase){seq=row/5;source=cu[seq]+row%5;}
+ if(row<rows){int seq,source,floor=0;bool kept=true;
+ if(phase==1){seq=row/5;source=cu[seq]+row%5;}
+ else if(phase==2){seq=row/keep;int end=cu[seq+1],n=min(keep,end-cu[seq]),i=row%keep;kept=n>0&&i>=keep-n;source=max(end-keep+i,end-max(n,1));floor=input_pos[end-max(n,1)];}
  else {int lo=0,hi=seqs;while(lo+1<hi){int mid=(lo+hi)/2;if(cu[mid]<=row)lo=mid;else hi=mid;}seq=lo;source=row;}
- bool live=valid[source]!=0;req[row]=seq;pos[row]=input_pos[source];slots[row]=live?input_slots[source]:-1;mask[row]=live;
+ bool live=kept&&valid[source]!=0;req[row]=seq;pos[row]=input_pos[source];slots[row]=live?input_slots[source]:-1;mask[row]=live;
  window_slots[row]=live?ring_slot(window_lines,seq,input_pos[source],ring):-1;
- ids32[row]=(int32_t)ids[phase?row:source];ends[row]=seq_lens[seq]-(phase?1:0);window_length[row]=live?(phase?min(seq_lens[seq]-1,133):min(input_pos[source]+1,128)):0;compressed_length[row]=live?512:0;}
- if(row<seqs){bool live=valid[cu[row]]!=0;starts[row]=phase?row*5:cu[row];seq_valid[row]=live;counts[row]=live?(phase?5:cu[row+1]-cu[row]):0;}
+ ids32[row]=(int32_t)ids[phase==1?row:source];ends[row]=seq_lens[seq]-(phase==1?1:0);window_length[row]=live?(phase==1?min(seq_lens[seq]-1,133):min(input_pos[source]-floor+1,128)):0;compressed_length[row]=live?512:0;source_rows[row]=source;}
+ if(row<seqs){bool live=valid[cu[row]]!=0;int count=cu[row+1]-cu[row];starts[row]=phase==1?row*5:phase==2?row*keep:cu[row];seq_valid[row]=live;counts[row]=live?(phase==1?5:phase==2?min(keep,count):count):0;}
  if(row==0)starts[seqs]=rows;
 }
 extern "C" __global__ void dsv41_compressed_metadata(int64_t* out_slots,int32_t* out_pos,const int64_t* slots,const int32_t* pos,const uint8_t* valid,int rows,int ratio){
@@ -288,14 +294,18 @@ extern "C" __global__ void dsv41_cache_index(uint8_t* cache,const uint8_t* packe
 }
 
 // Query-local causal bounds and physical page IDs for direct paged index scoring.
-extern "C" __global__ void dsv41_index_metadata(int* query_pages,int* end,int* request_ids,int* sparse_ends,const int* request,const int* position,const uint8_t* valid,const int* pages,int rows,int page_cols,int compressed_page_size,int ratio){
+// Every row carries its sequence's whole page row: dense scoring runs each
+// run of equal `runs` as one request through its first row's table, out to
+// its last row's end, and the first row may be a replay's padding. A run is a
+// sequence's rows within one 128-row block, so a long sequence spreads its
+// key splits over as many SMs as a batch of short ones, and no row scores
+// more than 127 rows past its own end.
+extern "C" __global__ void dsv41_index_metadata(int* query_pages,int* end,int* request_ids,int* runs,int* sparse_ends,const int* request,const int* position,const uint8_t* valid,const int* pages,int rows,int page_cols,int ratio){
   pdl();
  int row=blockIdx.x;
- int length=valid[row]?(position[row]+1)/ratio:0;
- if(threadIdx.x==0){end[row]=length;request_ids[row]=row;sparse_ends[row]=valid[row]?16384:0;}
- int used=(length+compressed_page_size-1)/compressed_page_size;
+ if(threadIdx.x==0){end[row]=valid[row]?(position[row]+1)/ratio:0;request_ids[row]=row;runs[row]=request[row]^(row>>7&1)<<30;sparse_ends[row]=valid[row]?16384:0;}
  for(int col=threadIdx.x;col<page_cols;col+=256)
-  query_pages[(int64_t)row*page_cols+col]=col<used?pages[(int64_t)request[row]*page_cols+col]:0;
+  query_pages[(int64_t)row*page_cols+col]=pages[(int64_t)request[row]*page_cols+col];
 }
 
 extern "C" __global__ void dsv41_context_tap(bf16* out,const bf16* hc,int rows,int tap){

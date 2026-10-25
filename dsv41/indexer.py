@@ -2,12 +2,25 @@
 from dataclasses import dataclass
 
 from .forward import Lowered, projection, bf16_projection, scalar, selected, align4
+from .head import offset
 from .programs import buf, call, integer
 from .auxiliary.ops import definitions as auxiliary_ops
-from .attention.paged_indexer_ops import definitions as dense_ops
+from .attention.paged_indexer_ops import definitions as dense_ops, weights as weight_ops
 from .attention.paged_sparse_ops import definitions as sparse_ops
 from .attention.select_ops import definitions as select_ops
 from .attention.candidate_ops import definitions as candidate_ops
+
+
+# Dense scores are f32 [rows, context / ratio]: at 32k rows over a 1M context
+# that is 128 GiB a layer. They are made a query-row tile at a time into one
+# buffer per width, so their memory is a tile's whatever the capacity.
+TILE_BYTES = 4 << 30
+
+
+def tiles(capacity, row_bytes):
+    """(first row, rows) of each query-row tile whose scores fit TILE_BYTES."""
+    n = max(4, min(capacity, TILE_BYTES // row_bytes // 4 * 4))
+    return [(start, min(n, capacity - start)) for start in range(0, capacity, n)]
 
 
 @dataclass(frozen=True)
@@ -37,14 +50,19 @@ def forward(pieces, serving, layer, source, layouts, hidden, qr, *, mode,
     buffers, calls = {}, []
 
     def allocate(name, dtype, columns):
-        # The full-context score rows are the one workspace that scales with
-        # the context; prefill, decode and verify never run concurrently, so
-        # the three modes share it (a mode-less name) instead of each holding
-        # [capacity, context] of their own.
-        shared = name in ("scores", "block_scores")
-        name = (f"index{layer}" if shared else prefix) + "." + name
+        name = prefix + "." + name
         buffers[name] = {"dtype":dtype,"kind":"workspace","shape":[capacity,columns]}
         return name
+
+    def tile(name, dtype, rows, columns):
+        # A score tile: every layer of one shape runs one after another, so
+        # they share it (a layer-less name); each mode's row bound is its own.
+        name = f"index.{name}.{rows}x{columns}"
+        buffers[name] = {"dtype":dtype,"kind":"workspace","shape":[rows,columns]}
+        return name
+
+    def arg(b):
+        return buf(b) if isinstance(b, str) else b
 
     def extend(stage):
         buffers.update(stage.buffers)
@@ -66,20 +84,23 @@ def forward(pieces, serving, layer, source, layouts, hidden, qr, *, mode,
     raw_weights = prefix + ".weights_raw"
     extend(bf16_projection(pieces,prefix+".weights",hidden,weight+".weights_proj.weight",
                            raw_weights,rows=rows,capacity=capacity,n=32,k=5120))
-    dense = dense_ops(dense_cubin,rows=rows,rows_max=capacity,kv_rows_max=width,
-                      page_size=page,pages=pool_tokens//serving.layout.page_size,
-                      page_cols=serving.layout.pages)
-    names = pieces.add(selected(dense,"dsv41_index_weights") if layer > 20 else dense)
+    def dense(rows, rows_max):
+        # Layer 20's candidate blocks max over 8-key blocks, so its rows read
+        # past their end: only there do the tails need -infinity.
+        return dense_ops(dense_cubin,rows=rows,rows_max=rows_max,kv_rows_max=width,
+                         page_size=page,pages=pool_tokens//serving.layout.page_size,
+                         page_cols=serving.layout.pages,clean=layer==20)
+    names = pieces.add(weight_ops(dense_cubin,rows=rows))
     weights_bf16 = allocate("weights_bf16","bf16",32)
     weights_f32 = allocate("weights_f32","f32",32)
     calls.append(call(prefix+".scale_weights",names["dsv41_index_weights"],
                       buf(raw_weights),buf(weights_bf16),buf(weights_f32),scalar(rows)))
     logical = allocate("logical","i32",512)
 
-    def select(scores, ends, output, stride, topk, dtype, label):
-        name = pieces.add(select_ops(select_cubin,rows=rows,rows_max=capacity,
+    def select(scores, ends, output, stride, topk, dtype, label, rows=rows, rows_max=capacity):
+        name = pieces.add(select_ops(select_cubin,rows=rows,rows_max=rows_max,
                           width=stride,topk=topk,dtype=dtype))["dsv41_select"]
-        calls.append(call(prefix+"."+label,name,buf(scores),buf(ends),buf(output),scalar(rows)))
+        calls.append(call(prefix+"."+label,name,arg(scores),arg(ends),arg(output),scalar(rows)))
 
     if layer > 20:
         if candidates is None:
@@ -97,24 +118,34 @@ def forward(pieces, serving, layer, source, layouts, hidden, qr, *, mode,
         calls.append(call(prefix+".positions",sparse["dsv41_sparse_positions"],buf(scores),buf(slots),
                           buf(candidates),buf(metadata["ends"]),buf(logical),scalar(rows)))
     else:
-        scores = allocate("scores","f32",width)
         cache = {"state":f"index_k.{source}"}
-        calls.append(call(prefix+".score",names["dsv41_paged_index_scores"],buf(packed),buf(scales),
-                          buf(weights_f32),buf(metadata["ends"]),buf(metadata["pages"]),cache,
-                          {"state":f"index_k.{source}","offset":page*64},buf(scores),scalar(rows)))
-        select(scores,metadata["ends"],logical,width,512,"f32","select_tokens")
+        block_stride = ((width//8+255)//256)*256
+        spans = tiles(capacity,width*4)
+        scores = tile("scores","f32",spans[0][1],width)
         if layer == 20:
-            block_stride = ((width//8+255)//256)*256
-            block_scores = allocate("block_scores","f32",block_stride)
+            block_scores = tile("block_scores","f32",spans[0][1],block_stride)
             block_ends = allocate("block_ends","i32",1)
             selected_blocks = allocate("selected_blocks","i32",2048)
             candidates = allocate("candidates","i32",2048)
-            adapters = pieces.add(candidate_ops(candidate_cubin,rows=rows,width=width,block_stride=block_stride))
-            calls.append(call(prefix+".block_scores",adapters["dsv41_candidate_scores"],buf(scores),
-                              buf(metadata["ends"]),buf(block_scores),buf(block_ends),scalar(rows)))
-            select(block_scores,block_ends,selected_blocks,block_stride,2048,"f32","select_blocks")
-            calls.append(call(prefix+".filter_blocks",adapters["dsv41_selection_filter"],buf(block_scores),
-                              buf(selected_blocks),buf(candidates),scalar(rows)))
+        for k, (first, n) in enumerate(spans):
+            t = {"clamp":[rows,first,n]} if len(spans) > 1 else rows
+            def at(name, row_bytes):
+                return offset(name,first*row_bytes) if first else buf(name)
+            ends = at(metadata["ends"],4)
+            score = pieces.add(dense(t,n))["dsv41_paged_index_scores"]
+            calls.append(call(prefix+f".score.t{k}",score,at(packed,2048),at(scales,128),
+                              at(weights_f32,128),ends,at(metadata["pages"],serving.layout.pages*4),
+                              at(mode+".index_runs",4),cache,
+                              {"state":f"index_k.{source}","offset":page*64},buf(scores),scalar(t)))
+            select(scores,ends,at(logical,2048),width,512,"f32",f"select_tokens.t{k}",rows=t,rows_max=n)
+            if layer == 20:
+                adapters = pieces.add(candidate_ops(candidate_cubin,rows=t,width=width,block_stride=block_stride))
+                calls.append(call(prefix+f".block_scores.t{k}",adapters["dsv41_candidate_scores"],buf(scores),
+                                  ends,buf(block_scores),at(block_ends,4),scalar(t)))
+                select(block_scores,at(block_ends,4),at(selected_blocks,8192),block_stride,2048,"f32",
+                       f"select_blocks.t{k}",rows=t,rows_max=n)
+                calls.append(call(prefix+f".filter_blocks.t{k}",adapters["dsv41_selection_filter"],buf(block_scores),
+                                  at(selected_blocks,8192),at(candidates,8192),scalar(t)))
     physical = allocate("physical","i32",512)
     calls += serving.compressed_indices(mode,ratio,logical,physical)
     return Indexed(Lowered(buffers,calls),logical,physical,candidates)

@@ -29,8 +29,9 @@ whole set builds in about 11 seconds. `build.py` writes
 
 - `build/<module>.cubin` for every module in `kernels.toml`, each checked
   against its `sha256` (a mismatch fails the build and names the modules);
-- `build/moe_layout_<experts>_sm<sms>.json`, the MegaMoE ring layouts for
-  128 and 384 experts at 148 and 152 SMs (B300 and GB300).
+- `build/moe_layout_<experts>_sm<sms>_t<tokens>.json`, the MegaMoE ring layouts
+  for 128 and 384 experts at 148 and 152 SMs (B300 and GB300), sized for at
+  most `tokens` rows a rank (8192, and 32768 for the 384-expert prefill).
 
 nvcc runs from the repository root on relative paths, so the bytes do not
 depend on where the repository is cloned. `build.py <module>...` rebuilds a

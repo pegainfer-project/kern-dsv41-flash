@@ -35,7 +35,7 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, max_seqs, pool_to
                        workspace=prefix+".moe",experts=128,cubin_dir=cubin_dir,device_sms=device_sms)
         state, stage = blocks.layer(state,layer,attn,ffn,
                                     attention_fp8=fp8_input(prefix+".attention",capacity)[1],
-                                    ffn_fp8=moe_fp8_input(prefix+".moe",experts=128,cubin_dir=cubin_dir,rows=rows,device_sms=device_sms))
+                                    ffn_fp8=moe_fp8_input(prefix+".moe",capacity=capacity,experts=128,cubin_dir=cubin_dir,rows=rows,device_sms=device_sms))
         buffers.update(stage.buffers)
         calls.extend(stage.calls)
     collapsed, normalized = prefix+".collapsed", "draft.head_hidden"

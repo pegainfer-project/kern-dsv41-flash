@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build every module in kernels.toml into build/<module>.cubin and the MegaMoE
-layouts into build/moe_layout_<experts>_sm<sms>.json, then check each against
+layouts into build/moe_layout_<experts>_sm<sms>_t<tokens>.json, then check each against
 its pinned sha256.
 
 nvcc runs from the repository root on relative paths and is told the source's
@@ -67,10 +67,10 @@ def layouts(nvcc, cfg):
     spec = cfg["layouts"]
     tool = BUILD / "moe_layout"
     run(*command(nvcc, cfg, {"source": spec["tool"], **spec}, cubin=False, out=tool))
-    for experts in spec["experts"]:
+    for experts, tokens in spec["instances"]:
         for sms in spec["sms"]:
-            out = ROOT / BUILD / f"moe_layout_{experts}_sm{sms}.json"
-            out.write_text(subprocess.run([ROOT / tool, str(experts), str(sms)], check=True,
+            out = ROOT / BUILD / f"moe_layout_{experts}_sm{sms}_t{tokens}.json"
+            out.write_text(subprocess.run([ROOT / tool, str(experts), str(sms), str(tokens)], check=True,
                                           capture_output=True, text=True).stdout)
 
 

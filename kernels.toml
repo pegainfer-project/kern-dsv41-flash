@@ -62,12 +62,12 @@ deepselect = [
 [kernels.copy_rows]
 source = "source/copy_rows.cu"
 flags = "default"
-sha256 = "ba71c7fe9b6e1f2eaa29d395dacc3f01b49e7f9613b094ce8ab55f1cfeda8c5b"
+sha256 = "ac0a69424924e3329368fc5bc97d6dcea5df56bf402cf3eababbf2d969177fbe"
 
 [kernels.dsv41_auxiliary]
 source = "source/auxiliary/auxiliary.cu"
 flags = "nofma"
-sha256 = "a9267dc85dd09235e41a9c269325347739388e6131d7f1bd526e477fcb4a3bfe"
+sha256 = "176d1d9b68a626657275279b7b87bf2df349d9b538f7cddd1eba96149c7ba8ba"
 
 [kernels.dsv41_engram_peers]
 source = "source/auxiliary/engram_peers.cu"
@@ -88,25 +88,25 @@ sha256 = "f8d2c2761ceafffd0e50f1d159de9ab3410b661e42af2da74f1e5eed26a04626"
 source = "source/moe/mega_mhc.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-sha256 = "8e07ee003d917d31ccc5d4b1c1711d79138e97619936eada3057212d376aa802"
+sha256 = "1bddd0ce1e83f82900814ff0ee4710e282b47e604d9481280b5820de6b1634aa"
 
 [kernels.dsv41_gate]
 source = "source/moe/mega_gate.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-sha256 = "efca572e7555d7c425260e98e2a0c5ea3ae6568e562cdd36ebc5253e03fbda8d"
+sha256 = "b237817b759f9416c0d9734ad2cae6a5a5f4d1c87c8b19da95aa68232fa52f7d"
 
 [kernels.dsv41_dense]
 source = "source/moe/dense.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-sha256 = "e713c3a672e095a8de49957bb84a9fdf7b963c5f5004f573a1df87078e3c772c"
+sha256 = "f24b132d09f14cee2a7ef1c97e8da212bcf9cc98dc3254a0c74ceff0436a220a"
 
 [kernels.dsv41_mega_moe]
 source = "source/moe/mega_moe.cu"
 flags = "deepgemm"
 includes = "mega-moe"
-sha256 = "b417cc1d4f8a706ca23d9110fd1649f302fc250839b34ae0b628c1100398d1a5"
+sha256 = "4b17306a4d95137ac830fe16df58a87db35f83b0f3390437df2a5aaba65d84d4"
 
 [kernels.dsv41_moe_stage]
 source = "source/moe/stage.cu"
@@ -133,7 +133,7 @@ sha256 = "9de2512e1b7db3fe7e1c723d2f79d99ab1c7d9d982acea1f24dfbca71d407709"
 source = "source/attention/paged_indexer.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-sha256 = "046607fb7c0457bdb013598238ae0176cda10e6ca46e33f5b5f8679eebc4855d"
+sha256 = "1977889dac3812578293ed513d52f60159e1fc9ab5651aa271ee0fb9206d8806"
 
 [kernels.dsv41_sparse_indexer]
 source = "source/attention/sparse_indexer.cu"
@@ -163,5 +163,6 @@ sha256 = "83a1cd23bb15864787adb483d4a8b0737fb2c1c4d3a875750306d9a0f1ac0b8a"
 tool = "source/moe/moe_layout.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-experts = [128, 384]
+# (experts, most tokens a rank feeds one call): the draft MoE decodes only.
+instances = [[128, 8192], [384, 8192], [384, 32768]]
 sms = [148, 152]

@@ -58,10 +58,12 @@ def barriers(pieces, *, cubin_dir=None):
 
     Upstream allocates each once per stream and never clears it again; the
     kernels leave the words consistent between calls, so every program
-    shares one buffer per kernel and `load` is the only other writer.
+    shares one buffer per kernel and `load` is the only other writer. Sizes
+    are upstream's: one 128-byte line per block of 2^20 tokens (mHC: two
+    barriers of 64-row blocks; Gate: 16-token blocks, its smallest tile).
     """
     from .moe import ops
-    shapes = {MHC_BARRIERS: 524288, GATE_BARRIERS: 8192}
+    shapes = {MHC_BARRIERS: 2*16384*16, GATE_BARRIERS: 65536*16}
     buffers = {name: {"dtype": "u64", "shape": [count], "kind": "carry"} for name, count in shapes.items()}
     calls = [call(name + ".clear", pieces.add(ops.zero(count, cubin_dir=cubin_dir))["dsv41_zero_u64"],
                   buf(name), integer(count)) for name, count in shapes.items()]

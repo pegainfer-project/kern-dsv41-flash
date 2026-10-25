@@ -13,7 +13,7 @@ def main():
     torch.manual_seed(432);torch.empty(1,device='cuda');drv=ctypes.CDLL('libcuda.so.1')
     cubins=a.cubins or pathlib.Path(__file__).resolve().parents[2]/'build';stage=check(cu.cuModuleLoad(str(cubins/'dsv41_moe_stage.cubin').encode()))
     for n,fp8 in [(n,fp8) for n in (1,5,65,128) for fp8 in ('gemm','moe')]:
-        shared_rows=131072;modules,ops=pieces(rows=n,max_tokens=n,fp8=fp8,shared_rows=shared_rows if fp8=='moe' else None,cubin_dir=str(cubins),**({'splits':a.splits} if a.splits else {}));launch=ops['dsv41_mhc']['impl']['launches'][-1]
+        shared_rows=131072;modules,ops=pieces(rows=n,max_tokens=n,fp8=fp8,shared_rows=shared_rows if fp8=='moe' else None,blocks=[(16,1,n)] if fp8=='moe' else None,cubin_dir=str(cubins),**({'splits':a.splits} if a.splits else {}));launch=ops['dsv41_mhc']['impl']['launches'][-1]
         x=torch.randn(n,5120,device='cuda',dtype=torch.bfloat16);r=torch.randn(n,4,5120,device='cuda',dtype=torch.bfloat16)
         post=torch.randn(n,4,device='cuda').sigmoid();comb=torch.randn(n,4,4,device='cuda').softmax(-1);pre=torch.randn_like(post).sigmoid()
         fn=torch.randn(24,20480,device='cuda')*.01;scales=torch.randn(3,device='cuda')*.1;bases=torch.randn(24,device='cuda')*.1;norm=torch.randn(5120,device='cuda',dtype=torch.bfloat16)*.1+1

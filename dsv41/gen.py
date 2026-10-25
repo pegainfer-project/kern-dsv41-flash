@@ -16,6 +16,7 @@ from dsv41.draft_context import capture, publish
 from dsv41.target import forward, head
 from dsv41.draft import forward as draft_forward
 from dsv41.programs import Stages, assemble, spec_ops
+from dsv41.forward import align4
 
 
 def bundle(manifest, destination, roots):
@@ -51,7 +52,7 @@ def engram_shards(raw):
     return shards
 
 
-def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=32768, device_sms=152):
+def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=32768, device_sms=152, prefill_only=False, replay=0):
     cubin = lambda module: kernels/f"{module}.cubin"
     cubin_dir, auxiliary_cubin, head_cubin = kernels, cubin("dsv41_auxiliary"), cubin("dsv41_head")
     fused_cubin = cubin("dsv41_fused_decode")
@@ -62,7 +63,7 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
     expert_buffers, expert_load, expert_layouts = expert_weights(projections,pieces,cubin_dir=cubin_dir)
     barrier_buffers, barrier_load = barriers(pieces,cubin_dir=cubin_dir)
     engram = engram_shards(raw)
-    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context),
+    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context,replay=replay),
                     peers=cubin("dsv41_engram_peers") if engram else None)
     buffers = {**dense_buffers,**expert_buffers,**barrier_buffers,**constants["buffers"]}
     pieces.fixed((constants["modules"],constants["ops"]))
@@ -71,19 +72,25 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
     buffers["next_token"] = {"kind":"output","dtype":"i64","shape":["seqs"],
                               "fill":"tokens","domain":{"index_into":"embed.weight"}}
     forwards, contexts, commits = {}, {}, []
+    # Each mode's workspaces hold the rows it can run: a prompt chunk, one row a
+    # sequence, or a six-row verification round a sequence.
+    rows = {"prefill":capacity,"decode":align4(max_seqs),"verify":align4(6*max_seqs)}
     for mode in ("prefill","decode","verify"):
         target = forward(pieces,serving,dense_layouts,expert_layouts,mode=mode,ids="verify_ids" if mode=="verify" else "input_ids",
-                         capacity=capacity,pool_tokens=context,constants=constants,cubin_dir=cubin_dir,
+                         capacity=rows[mode],pool_tokens=context,constants=constants,cubin_dir=cubin_dir,
                          auxiliary_cubin=auxiliary_cubin,attention_cubin=None,fused_cubin=fused_cubin,
                          head_cubin=head_cubin,dense_cubin=cubin("dsv41_paged_indexer"),
                          sparse_cubin=cubin("dsv41_sparse_indexer"),select_cubin=cubin("dsv41_deepselect"),
                          candidate_cubin=cubin("dsv41_candidate"),
-                         capture_tap=lambda layer,hc: capture(pieces,hc,layer,mode=mode,rows="tokens",
-                                                              capacity=capacity,auxiliary_cubin=auxiliary_cubin),
-                         engram=engram,device_sms=device_sms)
-        output = head(pieces,target.normalized,"verify_tokens" if mode=="verify" else "next_token",mode=mode,capacity=capacity,vocab=vocab,
-                      head_cubin=head_cubin,copy_cubin=cubin("copy_rows"))
-        context_stage = publish(pieces,serving,dense_layouts,mode=mode,capacity=capacity,
+                         capture_tap=lambda layer,hc,m,cap: capture(pieces,hc,layer,mode=m,rows=serving.rows(m),
+                                                                    capacity=cap,auxiliary_cubin=auxiliary_cubin),
+                         engram=engram,device_sms=device_sms,
+                         replay_capacity=(max_seqs*replay+3)//4*4,copy_cubin=cubin("copy_rows"))
+        output = head(pieces,target.normalized,"verify_tokens" if mode=="verify" else "next_token",mode=mode,capacity=rows[mode],max_seqs=max_seqs,vocab=vocab,
+                      head_cubin=head_cubin,copy_cubin=cubin("copy_rows"),starts=target.starts)
+        replayed = mode == "prefill" and replay
+        context_stage = publish(pieces,serving,dense_layouts,mode="replay" if replayed else mode,
+                                capacity=(max_seqs*replay+3)//4*4 if replayed else rows[mode],
                                 auxiliary_cubin=auxiliary_cubin,cubin_dir=cubin_dir,
                                 cos_sin=constants["rope"]["window"]["interleaved"])
         for stage in (target.lowered,output,context_stage):
@@ -108,9 +115,11 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
     programs = assemble(Stages(programs["load"]["calls"],forwards["prefill"],forwards["decode"],draft.calls,
                                forwards["verify"],contexts["prefill"],contexts["decode"],contexts["verify"],commits),
                         max_seqs=max_seqs)
+    if prefill_only:
+        programs = {name:programs[name] for name in ("load","prefill")}
     aux = serving.pieces(programs)
     buffers.update(aux["buffers"])
-    for name in ("input_ids","anchor_token"):
+    for name in {"input_ids","anchor_token"} & buffers.keys():
         buffers[name] = {**buffers[name],"domain":{"index_into":"embed.weight"}}
     used = {a["buf"] for p in programs.values() for c in p["calls"] for a in c["args"] if "buf" in a}
     for name in sorted(used - buffers.keys()):
@@ -154,6 +163,10 @@ def main():
     parser.add_argument("--context",type=int,default=1048576,help="page-table bound per sequence, in tokens (the model's 1M)")
     parser.add_argument("--sms",dest="device_sms",type=int,default=152,choices=(148,152),
                         help="SMs per GPU of the device served: GB300 152, B300 148")
+    parser.add_argument("--prefill-only",action="store_true",
+                        help="keep load and prefill only: a prefill tier's manifest, without decode's buffers")
+    parser.add_argument("--replay",type=int,default=0,
+                        help="prefill ends at the encoder; each sequence's last N rows replay the decoder (SWA Bounded Replay; 0: the whole forward)")
     parser.add_argument("--bundle",type=Path,help="copy pinned cubins to a serving artifact directory")
     args = vars(parser.parse_args())
     binding_file, checkpoint, engram = args.pop("bindings"), args.pop("checkpoint"), args.pop("engram")

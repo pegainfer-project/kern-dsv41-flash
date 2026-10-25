@@ -29,7 +29,7 @@ def capture(pieces, materialized_hc, layer, *, mode, rows, capacity, auxiliary_c
 
 def publish(pieces, serving, layouts, *, mode, capacity, auxiliary_cubin, cubin_dir,
             cos_sin="rope.window.interleaved", accepted="nacc"):
-    if mode not in ("prefill", "decode", "verify"):
+    if mode not in ("prefill", "replay", "decode", "verify"):
         raise ValueError("context publication consumes target forward rows")
     rows=serving.rows(mode)
     prefix=f"{mode}.draft_context"
