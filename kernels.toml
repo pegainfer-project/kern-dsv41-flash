@@ -1,4 +1,5 @@
-# Every module the DeepSeek V4.1 Flash `load` and `prefill` programs launch.
+# Every module the DeepSeek V4.1 Flash manifest launches, save the Engram
+# constants derived from the checkpoint.
 # `scripts/build.py` compiles each from `source` with the named `flags` and
 # `includes`, writes `build/<module>.cubin`, and checks it against `sha256`.
 
@@ -61,112 +62,100 @@ deepselect = [
 [kernels.copy_rows]
 source = "source/copy_rows.cu"
 flags = "default"
-programs = ["prefill"]
 sha256 = "ba71c7fe9b6e1f2eaa29d395dacc3f01b49e7f9613b094ce8ab55f1cfeda8c5b"
 
 [kernels.dsv41_auxiliary]
 source = "source/auxiliary/auxiliary.cu"
 flags = "nofma"
-programs = ["prefill"]
 sha256 = "a9267dc85dd09235e41a9c269325347739388e6131d7f1bd526e477fcb4a3bfe"
 
 [kernels.dsv41_engram_peers]
 source = "source/auxiliary/engram_peers.cu"
 flags = "nofma"
-programs = ["prefill"]
 sha256 = "dd90f061db9cd365e549aa0a9509c591516918d5543fb23f8a37d031336ee64a"
 
 [kernels.dsv41_head]
 source = "source/head.cu"
 flags = "plain"
-programs = ["prefill"]
 sha256 = "deea7150d71f4d977134eb55888d4af0ac2b5397095b5f8946ebd2842bbc3e2d"
 
 [kernels.dsv41_moe_boundary]
 source = "source/moe/boundary.cu"
 flags = "plain-nofma"
-programs = ["prefill"]
 sha256 = "f8d2c2761ceafffd0e50f1d159de9ab3410b661e42af2da74f1e5eed26a04626"
 
 [kernels.dsv41_mhc]
 source = "source/moe/mega_mhc.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-programs = ["prefill"]
 sha256 = "8e07ee003d917d31ccc5d4b1c1711d79138e97619936eada3057212d376aa802"
 
 [kernels.dsv41_gate]
 source = "source/moe/mega_gate.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-programs = ["prefill"]
 sha256 = "efca572e7555d7c425260e98e2a0c5ea3ae6568e562cdd36ebc5253e03fbda8d"
 
 [kernels.dsv41_dense]
 source = "source/moe/dense.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-programs = ["prefill"]
 sha256 = "e713c3a672e095a8de49957bb84a9fdf7b963c5f5004f573a1df87078e3c772c"
 
 [kernels.dsv41_mega_moe]
 source = "source/moe/mega_moe.cu"
 flags = "deepgemm"
 includes = "mega-moe"
-programs = ["prefill"]
 sha256 = "b417cc1d4f8a706ca23d9110fd1649f302fc250839b34ae0b628c1100398d1a5"
 
 [kernels.dsv41_moe_stage]
 source = "source/moe/stage.cu"
 flags = "plain"
-programs = ["prefill"]
 sha256 = "ad89b59c61e4242f02b8573c4ccb4040354f1950dd0dc8c6458b4159f5c86615"
 
 [kernels.dsv41_weight_prep]
 source = "source/moe/weight_prep.cu"
 flags = "plain"
-programs = ["load"]
 sha256 = "0b82003253426728f2a76f5386168211f62a79fb401006a8806ee45168734164"
 
 [kernels.dsv41_fused_prep]
 source = "source/moe/fused_prep.cu"
 flags = "plain"
-programs = ["load"]
 sha256 = "b56ed124406c947aed2b22db011a051762577982dbe8ee7608a68a6e4353df63"
 
 [kernels.dsv41_fused_decode]
 source = "source/attention/fused_probe.cu"
 flags = "lambda"
 includes = "flashmla-fused"
-programs = ["prefill"]
 sha256 = "9de2512e1b7db3fe7e1c723d2f79d99ab1c7d9d982acea1f24dfbca71d407709"
 
 [kernels.dsv41_paged_indexer]
 source = "source/attention/paged_indexer.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-programs = ["prefill"]
 sha256 = "046607fb7c0457bdb013598238ae0176cda10e6ca46e33f5b5f8679eebc4855d"
 
 [kernels.dsv41_sparse_indexer]
 source = "source/attention/sparse_indexer.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-programs = ["prefill"]
 sha256 = "5cd9943701c2facbd5929434db6ac63f4faa1b383c5645218a6782037648fa1e"
 
 [kernels.dsv41_deepselect]
 source = "source/attention/select_probe.cu"
 flags = "lambda"
 includes = "deepselect"
-programs = ["prefill"]
 sha256 = "f10df0a5be9ade14b42ddfd1ccb903ee5471a8a0a15fb73b33a7809f300b284e"
 
 [kernels.dsv41_candidate]
 source = "source/attention/candidate.cu"
 flags = "plain"
-programs = ["prefill"]
 sha256 = "c4b6c2d2ac836d8f6be0fceaf987e75fe4b3c40e44ba5ee8330b428e7730ae6c"
+
+[kernels.dsv41_spec_round]
+source = "source/spec_round.cu"
+flags = "default"
+sha256 = "83a1cd23bb15864787adb483d4a8b0737fb2c1c4d3a875750306d9a0f1ac0b8a"
 
 # The MegaMoE ring is sized from the pool its persistent grid drains: one
 # layout per expert count and SM count the cubin carries an instance for.

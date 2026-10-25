@@ -14,8 +14,6 @@
 //     kern_k3_mla_chunk_plan; the base is a runtime value no manifest
 //     expression reaches, so the kernel reads the plan). One entry for
 //     every dtype: rows are bytes.
-//
-//   nvcc -cubin -arch=sm_103a -o kernels/copy_rows.cubin tools/kernels-src/copy_rows.cu
 #include <cuda_bf16.h>
 
 extern "C" __global__ void kern_copy_rows_bf16(

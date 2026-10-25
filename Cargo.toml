@@ -1,0 +1,24 @@
+# The GPU harnesses over kern's public API, pinned to the kern commit whose
+# manifest schema `dsv41/schema.py` writes; a kern bump moves both together.
+[workspace]
+resolver = "2"
+members = ["dsv41/attention/ar_trace", "dsv41/moe/runtime_replay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "ff88b4f24e3a455491af02bedb1639bde6a56b88" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "ff88b4f24e3a455491af02bedb1639bde6a56b88" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "ff88b4f24e3a455491af02bedb1639bde6a56b88" }
+kern-run = { git = "https://github.com/pegainfer-project/kern", rev = "ff88b4f24e3a455491af02bedb1639bde6a56b88" }
+anyhow = "1"
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.11"
+
+[workspace.lints.clippy]
+type_complexity = "allow"
+needless_range_loop = "allow"

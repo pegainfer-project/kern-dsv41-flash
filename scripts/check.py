@@ -22,8 +22,6 @@ def main():
             errors.append(f"{name}: unknown flag set {k['flags']}")
         if "includes" in k and k["includes"] not in cfg["includes"]:
             errors.append(f"{name}: unknown include set {k['includes']}")
-        if not set(k["programs"]) <= {"load", "prefill"}:
-            errors.append(f"{name}: programs {k['programs']}")
     for set_name, paths in cfg["includes"].items():
         errors += [f"include set {set_name}: {p} is outside third_party/, source/ and build/"
                    for p in paths if p.split("/")[0] not in ("third_party", "source", "build")]

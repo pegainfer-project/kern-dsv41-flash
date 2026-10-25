@@ -8,7 +8,6 @@
 // offset into the buffer argument and passes the row stride in elements;
 // grid.x is the sequence index. Stride 1 / n reproduces the unstrided
 // kernels exactly (same reduction order), so seqs = 1 is the old chain.
-//   nvcc -cubin -arch=sm_103a -o target/cubins/markov_rows.cubin tools/kernels-src/markov_rows.cu
 #include <cuda_bf16.h>
 #include <limits.h>
 
