@@ -1,0 +1,182 @@
+# Every module the DeepSeek V4.1 Flash `load` and `prefill` programs launch.
+# `scripts/build.py` compiles each from `source` with the named `flags` and
+# `includes`, writes `build/<module>.cubin`, and checks it against `sha256`.
+
+[toolchain]
+nvcc = "13.1.115"
+arch = "sm_103a"
+
+# The submodules under third_party/, each MIT-licensed by DeepSeek; `check.py`
+# holds the gitlinks to these commits.
+[upstreams.DeepGEMM]
+url = "https://github.com/deepseek-ai/DeepGEMM"
+commit = "ab69f76be5bb9ea3499bc755002b1a876cb0b3d9"
+note = "PR #432, the V4.1 public release"
+
+[upstreams.FlashMLA]
+url = "https://github.com/deepseek-ai/FlashMLA"
+commit = "4f38f29ef6793c228363e4af5be66d44e81167ba"
+note = "PR #221, branch v41-open-source"
+
+[upstreams.DeepSelect]
+url = "https://github.com/deepseek-ai/DeepSelect"
+commit = "8e70df71d2a4b0c969ef96dc3b8998efa09a3315"
+note = "drops do_check_nan: older TopkSelectArgs offsets do not apply"
+
+[flags]
+default = []
+plain = ["-std=c++20", "-O3"]
+nofma = ["--fmad=false"]
+plain-nofma = ["-std=c++20", "-O3", "--fmad=false"]
+deepgemm = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "-DDG_NO_TORCH"]
+lambda = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG"]
+
+# Include paths, searched in order. `build/upstream/` is what `build.py`
+# prepares from the submodules: DeepGEMM with `patches/` applied, MegaMoE
+# forked onto kern's peer table, FlashMLA's fused core with its NVCC 13 fix.
+[includes]
+deepgemm = [
+    "third_party/DeepGEMM/deep_gemm/include",
+    "third_party/DeepGEMM/third-party/cutlass/include",
+]
+deepgemm-patched = [
+    "build/upstream/deepgemm-patched/include",
+    "third_party/DeepGEMM/third-party/cutlass/include",
+]
+mega-moe = [
+    "source/moe/include",
+    "build/upstream/mega-moe",
+    "third_party/DeepGEMM/deep_gemm/include",
+    "third_party/DeepGEMM/third-party/cutlass/include",
+]
+flashmla-fused = [
+    "build/upstream/flashmla-fused",
+    "third_party/FlashMLA/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn",
+    "third_party/FlashMLA/csrc",
+    "third_party/FlashMLA/csrc/kerutils/include",
+    "third_party/FlashMLA/csrc/cutlass/include",
+]
+deepselect = [
+    "third_party/DeepSelect/csrc",
+    "third_party/DeepSelect/csrc/3rdparty/cutlass/include",
+    "third_party/DeepSelect/csrc/3rdparty/kerutils/include",
+]
+
+[kernels.copy_rows]
+source = "source/copy_rows.cu"
+flags = "default"
+programs = ["prefill"]
+sha256 = "ba71c7fe9b6e1f2eaa29d395dacc3f01b49e7f9613b094ce8ab55f1cfeda8c5b"
+
+[kernels.dsv41_auxiliary]
+source = "source/auxiliary/auxiliary.cu"
+flags = "nofma"
+programs = ["prefill"]
+sha256 = "a9267dc85dd09235e41a9c269325347739388e6131d7f1bd526e477fcb4a3bfe"
+
+[kernels.dsv41_engram_peers]
+source = "source/auxiliary/engram_peers.cu"
+flags = "nofma"
+programs = ["prefill"]
+sha256 = "dd90f061db9cd365e549aa0a9509c591516918d5543fb23f8a37d031336ee64a"
+
+[kernels.dsv41_head]
+source = "source/head.cu"
+flags = "plain"
+programs = ["prefill"]
+sha256 = "deea7150d71f4d977134eb55888d4af0ac2b5397095b5f8946ebd2842bbc3e2d"
+
+[kernels.dsv41_moe_boundary]
+source = "source/moe/boundary.cu"
+flags = "plain-nofma"
+programs = ["prefill"]
+sha256 = "f8d2c2761ceafffd0e50f1d159de9ab3410b661e42af2da74f1e5eed26a04626"
+
+[kernels.dsv41_mhc]
+source = "source/moe/mega_mhc.cu"
+flags = "deepgemm"
+includes = "deepgemm-patched"
+programs = ["prefill"]
+sha256 = "4c6b3c5844f1dfe77f01a29f3dd1765be5479e63790ebc7c20df6466ad68aa0d"
+
+[kernels.dsv41_gate]
+source = "source/moe/mega_gate.cu"
+flags = "deepgemm"
+includes = "deepgemm-patched"
+programs = ["prefill"]
+sha256 = "25443e977206b8bd50db2881e67bec2c0b0aece4b0718356e56216b7597a5796"
+
+[kernels.dsv41_dense]
+source = "source/moe/dense.cu"
+flags = "deepgemm"
+includes = "deepgemm-patched"
+programs = ["prefill"]
+sha256 = "e3bf344bf9ea82c8cebfe6fc2943e0f1464756ccace65a935d1529c82f5dfcb8"
+
+[kernels.dsv41_mega_moe]
+source = "source/moe/mega_moe.cu"
+flags = "deepgemm"
+includes = "mega-moe"
+programs = ["prefill"]
+sha256 = "b417cc1d4f8a706ca23d9110fd1649f302fc250839b34ae0b628c1100398d1a5"
+
+[kernels.dsv41_moe_stage]
+source = "source/moe/stage.cu"
+flags = "plain"
+programs = ["prefill"]
+sha256 = "ad89b59c61e4242f02b8573c4ccb4040354f1950dd0dc8c6458b4159f5c86615"
+
+[kernels.dsv41_weight_prep]
+source = "source/moe/weight_prep.cu"
+flags = "plain"
+programs = ["load"]
+sha256 = "0b82003253426728f2a76f5386168211f62a79fb401006a8806ee45168734164"
+
+[kernels.dsv41_fused_prep]
+source = "source/moe/fused_prep.cu"
+flags = "plain"
+programs = ["load"]
+sha256 = "b56ed124406c947aed2b22db011a051762577982dbe8ee7608a68a6e4353df63"
+
+[kernels.dsv41_fused_decode]
+source = "source/attention/fused_probe.cu"
+flags = "lambda"
+includes = "flashmla-fused"
+programs = ["prefill"]
+sha256 = "9de2512e1b7db3fe7e1c723d2f79d99ab1c7d9d982acea1f24dfbca71d407709"
+
+[kernels.dsv41_paged_indexer]
+source = "source/attention/paged_indexer.cu"
+flags = "deepgemm"
+includes = "deepgemm"
+programs = ["prefill"]
+sha256 = "046607fb7c0457bdb013598238ae0176cda10e6ca46e33f5b5f8679eebc4855d"
+
+[kernels.dsv41_sparse_indexer]
+source = "source/attention/sparse_indexer.cu"
+flags = "deepgemm"
+includes = "deepgemm"
+programs = ["prefill"]
+sha256 = "5cd9943701c2facbd5929434db6ac63f4faa1b383c5645218a6782037648fa1e"
+
+[kernels.dsv41_deepselect]
+source = "source/attention/select_probe.cu"
+flags = "lambda"
+includes = "deepselect"
+programs = ["prefill"]
+sha256 = "f10df0a5be9ade14b42ddfd1ccb903ee5471a8a0a15fb73b33a7809f300b284e"
+
+[kernels.dsv41_candidate]
+source = "source/attention/candidate.cu"
+flags = "plain"
+programs = ["prefill"]
+sha256 = "c4b6c2d2ac836d8f6be0fceaf987e75fe4b3c40e44ba5ee8330b428e7730ae6c"
+
+# The MegaMoE ring is sized from the pool its persistent grid drains: one
+# layout per expert count and SM count the cubin carries an instance for.
+[layouts]
+tool = "source/moe/moe_layout.cu"
+flags = "deepgemm"
+includes = "deepgemm"
+experts = [128, 384]
+sms = [148, 152]

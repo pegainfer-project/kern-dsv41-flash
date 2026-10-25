@@ -1,0 +1,12 @@
+[submodule "third_party/DeepGEMM"]
+	path = third_party/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+	shallow = true
+[submodule "third_party/FlashMLA"]
+	path = third_party/FlashMLA
+	url = https://github.com/deepseek-ai/FlashMLA.git
+	shallow = true
+[submodule "third_party/DeepSelect"]
+	path = third_party/DeepSelect
+	url = https://github.com/deepseek-ai/DeepSelect.git
+	shallow = true
