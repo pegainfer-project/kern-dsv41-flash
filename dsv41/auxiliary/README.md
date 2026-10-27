@@ -34,9 +34,10 @@ GEMM needs no split. `rows` is the flattened local request-token dimension.
 | compress1 | input, norm weight, rows, dim, epsilon | ordinary BF16 RMSNorm |
 | norm_quant | input, norm weight, rows, dim, input row stride, scale row stride, epsilon | compress1 then the MXFP8 activation quantization of its result; outputs normalized BF16 `[rows,dim]`, E4M3 `[rows,dim]` and packed I32 scales `[dim/128,scale row stride]`; grid is align4(rows) so the four-row padding clears its scale words, as moe/stage.cu does |
 | norm_rope | input, norm weight, cos/sin, positions, rows, dim, rope dim, input row stride, inverse, epsilon | compress1 then rope over one head; only the rotated rows reach a buffer |
-| window_indices | request IDs, positions, block-end positions, window lines, rows, window size, output width, ring, noncausal, draft rows | output int32 ring token indices `[rows,width]` (`line*ring + position%ring`), invalid=-1 |
+| window_indices | request IDs, positions, block-end positions, window lengths, row starts, rows, window size, output width, noncausal, draft rows | output int32 work-area slots `[rows,width]` (see the window work area), invalid=-1 |
+| window_load | work area, window state, window lines, row starts, positions, sequence valid, seqs, window size, ring, page size | copies the 128 positions before a sequence's first row from its ring into its work prefix |
 | map_indices | logical selected positions, request IDs, positions, compressed pages, rows, topk, ratio, page size, stride | checks selected positions against `(position+1)//ratio` |
-| cache_fp8/cache_fp4 | input BF16, physical slots, rows, page size | state is page-major FlashMLA storage; negative slots skip writes |
+| cache_fp8/cache_fp4 | input BF16, physical slots, rows, page size | state is page-major FlashMLA storage; negative slots skip writes; `work_fp8` is the same kernel over a buffer |
 | cache_gather | cache state, physical slots, rows, page size, fp4 flag | output BF16 `[rows,512]`; negative slots become zero |
 | index_quant | packed bytes, E8M0 scales, BF16 dequant outputs; input, rows, dim | groups32; output packed `[rows,dim/2]`, scales `[rows,dim/32]` |
 | rope | input, cos/sin, positions, rows, heads, dim, rope dim, inverse | cos/sin float32 `[max_position,rope_dim/2,2]`; output same shape as input; input/output may alias; configure grid heads |
@@ -46,19 +47,27 @@ scale bytes. Compressed FP4 pages store `[page_size,256]` packed bytes then
 `[page_size,32]` E4M3 scale bytes. Thus logical page sizes are 528 and 288
 bytes/token, respectively. Per-token records are **not** interleaved.
 
-Window states are rings, not paged: each `{target,draft}.window.N` is a
-`bytes_per_seq` state of `Layout.ring` tokens (the 128-token window plus
-every row one step can write, rounded to whole pages: 256 at `max_tokens`
-128), laid out as `ring/page_size` consecutive FlashMLA pages. A row's
-window token index is `slot*ring + position%ring`, where `slot` is the
-sequence's entry in the `window.lines` line table (`[1, seqs]`, stride the
-ring bytes, so the runtime fills it with the slot itself; every window state
-of a lease shares it). `metadata` emits it as `window_slot` (-1 for padding)
-for `cache_fp8` and the draft context publication; `window_indices` derives
-the visible window from it. A write at position p lands on p-ring, which is
-older than any window a row of the same step reads, so no step can clobber
-what it still needs. Nothing about a sequence's earlier positions survives
-beyond the ring; only the last `ring` tokens are ever read.
+Window states carry the window between steps: each `{target,draft}.window.N`
+is a `bytes_per_seq` state of 256 positions (`Layout.ring`, two FlashMLA
+pages at page size 128), a ring addressed by `slot*256 + position%256`,
+where `slot` is the sequence's entry in the `window.lines` line table
+(`[1, seqs]`, stride the ring bytes, so the runtime fills it with the slot
+itself; every window state of a lease shares it). Only the rows within 128
+of a sequence's end this step reach the ring: `metadata` emits their ring
+index as `window_slot` (-1 for every other row, so no two rows of a step race
+for a slot) for `cache_fp8` and the draft context publication. The 128
+positions a step reads and the 128 it writes last never share a slot.
+
+A step attends over the window work area `window.work`, a page-major buffer
+of `256*max_seqs + max_tokens` slots (`Layout.work_rows`) reused by every
+layer. Sequence s owns the slots from `256*s + starts[s]`: a 256-slot prefix,
+whose last 128 `window_load` fills from the ring with the positions before
+the sequence's first row, then its rows, so position p sits at
+`256*(s+1) + starts[s] + p - pos[starts[s]]` (`metadata` emits a row's own
+as `work_slot`, for `work_fp8`) and a query's window is a contiguous run
+there, which `window_indices` enumerates. Draft rows reach the work area
+only; the verification's publication puts the accepted rows into the draft
+ring.
 
 Paged histories deliberately retain speculative projected positions. Only the
 accepted sequence extent grants visibility; a subsequent round must overwrite
@@ -129,7 +138,7 @@ unused definitions, so do not merge the complete helper catalog verbatim.
 host. It supports prefill chunks, decode1, verify6 and interior draft5. Draft
 selects staged positions/slots0..4 starting at the anchor; the previous
 accepted target row already supplies context through anchor_position-1. `window_slot` is the row's
-ring token index (see the window ring above). `window_length` is128 or
+ring index and `work_slot` its work-area slot (see the window ring above). `window_length` is128 or
 less for target,133 or less for draft (indices padded to192); both window and
 compressed lengths are zero for padding. Compressed length512 relies on each
 invalid index remaining-1. Masked physical slots are-1, so cache/history writes

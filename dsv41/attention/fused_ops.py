@@ -40,7 +40,7 @@ def definitions(cubin,*,rows,rows_max,pages,extra_pages,topk=128,extra_topk=512,
     def tm(at,param,cols,length,stride,box):
         return {'at':at,'tensormap':{'param':param,'dtype':'u32','dims':[cols,length],
             'strides':[stride],'box':[box,1],'swizzle':0,'l2_promotion':256}}
-    t=[tm(128,1,128,0 if cache_state else pages*page_size*528//512,512,132)]
+    t=[tm(128,1,128,pages*page_size*528//512,512,132)]
     if extra_topk:t += [tm(896,6,64,0 if cache_state else extra_pages*extra_page_size*288//256,256,68)]
     aux=[]
     for base,page in ((0,page_size),(12,extra_page_size)):

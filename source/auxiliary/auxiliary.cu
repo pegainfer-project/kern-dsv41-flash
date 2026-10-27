@@ -132,15 +132,41 @@ extern "C" __global__ void dsv41_compressor_gather(float* kv,float* score,int32_
 // Window token index inside a sequence's ring: ring tokens per slot, position
 // modulo ring inside it. The slot is the sequence's window line.
 __device__ int64_t ring_slot(const int32_t* lines,int seq,int position,int ring){return (int64_t)lines[seq]*ring+position%ring;}
-// Logical causal window indices. Each query receives exactly window entries;
-// invalid prefix entries are -1. A causal query sees the `lengths[row]` keys
-// ending at its own position (the metadata's window length, which a replay
-// bounds at its first replayed row); DSpark extends visibility to block_end[row].
-extern "C" __global__ void dsv41_window_indices(int32_t* out,const int32_t* req,const int32_t* pos,const int32_t* block_end,const int32_t* lengths,const int32_t* lines,int rows,int window,int width,int ring,int noncausal,int draft_rows){
+// The step's window work area: every sequence owns a segment of WINDOW_PREFIX
+// slots followed by its rows, so position p of sequence s sits at
+// work_slot(s, p) and a query's window is a contiguous run of slots. The
+// prefix holds the window the state carried in; rows before it are never
+// addressed (a window reaches back at most 133 positions).
+#define WINDOW_PREFIX 256
+__device__ int64_t work_slot(const int32_t* starts,const int32_t* pos,int seq,int position){
+ return (int64_t)WINDOW_PREFIX*(seq+1)+starts[seq]+(position-pos[starts[seq]]);
+}
+// Logical causal window indices into the work area. Each query receives
+// exactly window entries; invalid prefix entries are -1. A causal query sees
+// the `lengths[row]` keys ending at its own position (the metadata's window
+// length, which a replay bounds at its first replayed row); DSpark extends
+// visibility to block_end[row].
+extern "C" __global__ void dsv41_window_indices(int32_t* out,const int32_t* req,const int32_t* pos,const int32_t* block_end,const int32_t* lengths,const int32_t* starts,int rows,int window,int width,int noncausal,int draft_rows){
   pdl();
  int row=blockIdx.x;int end=noncausal?block_end[row]:pos[row]+1;
  int start=noncausal?max(0,end-window-draft_rows):end-lengths[row];int count=end-start;
- for(int i=threadIdx.x;i<width;i+=256)out[(int64_t)row*width+i]=(i<count)?(int32_t)ring_slot(lines,req[row],start+i,ring):-1;
+ for(int i=threadIdx.x;i<width;i+=256)out[(int64_t)row*width+i]=(i<count)?(int32_t)work_slot(starts,pos,req[row],start+i):-1;
+}
+// One page-major fp8 row (512 values, 16 scale bytes) copied between two
+// caches of the same page size, by slot.
+__device__ void copy_fp8_row(uint8_t* dst,int64_t dst_slot,const uint8_t* src,int64_t src_slot,int page_size,int piece){
+ int64_t db=(dst_slot/page_size)*(int64_t)page_size*528,sb=(src_slot/page_size)*(int64_t)page_size*528;
+ int dt=dst_slot%page_size,st=src_slot%page_size;
+ if(piece<32)*(uint4*)(dst+db+dt*512+piece*16)=*(const uint4*)(src+sb+st*512+piece*16);
+ else *(uint4*)(dst+db+(int64_t)page_size*512+dt*16)=*(const uint4*)(src+sb+(int64_t)page_size*512+st*16);
+}
+// The window a sequence carried in, from its state ring into the prefix of
+// its work segment: the `window` positions before its first row this step.
+extern "C" __global__ void dsv41_window_load(uint8_t* work,const uint8_t* state,const int32_t* lines,const int32_t* starts,const int32_t* pos,const int32_t* seq_valid,int seqs,int window,int ring,int page_size){
+  pdl();
+ int seq=blockIdx.x;if(!seq_valid[seq])return;int first=pos[starts[seq]];
+ for(int i=threadIdx.x;i<window*33;i+=256){int k=i/33,p=first-window+k;if(p<0)continue;
+  copy_fp8_row(work,work_slot(starts,pos,seq,p),state,(int64_t)lines[seq]*ring+p%ring,page_size,i%33);}
 }
 extern "C" __global__ void dsv41_map_indices(int32_t* out,const int32_t* logical,const int32_t* req,const int32_t* pos,const int32_t* pages,int rows,int topk,int ratio,int page_size,int page_stride){
   pdl();
@@ -245,7 +271,7 @@ extern "C" __global__ void dsv41_compressor_commit(float* state,const float* kv,
 // replay row is its last token, its window bounded at its first replayed row.
 // `valid` is a caller fill; token IDs and leased padding addresses cannot
 // reveal padded rows. source_rows[row] is the staged row each row reads.
-extern "C" __global__ void dsv41_metadata(int32_t* req,int32_t* pos,int64_t* slots,int64_t* window_slots,uint8_t* mask,int32_t* starts,int32_t* seq_valid,int32_t* ends,int32_t* ids32,int32_t* counts,int32_t* window_length,int32_t* compressed_length,int32_t* source_rows,const int32_t* input_pos,const int64_t* input_slots,const int32_t* valid,const int64_t* ids,const int32_t* cu,const int32_t* seq_lens,const int32_t* window_lines,int rows,int seqs,int phase,int ring,int keep){
+extern "C" __global__ void dsv41_metadata(int32_t* req,int32_t* pos,int64_t* slots,int64_t* window_slots,int64_t* work_slots,uint8_t* mask,int32_t* starts,int32_t* seq_valid,int32_t* ends,int32_t* ids32,int32_t* counts,int32_t* window_length,int32_t* compressed_length,int32_t* source_rows,const int32_t* input_pos,const int64_t* input_slots,const int32_t* valid,const int64_t* ids,const int32_t* cu,const int32_t* seq_lens,const int32_t* window_lines,int rows,int seqs,int phase,int ring,int keep){
   pdl();
  int row=blockIdx.x*256+threadIdx.x;
  if(row<rows){int seq,source,floor=0;bool kept=true;
@@ -253,7 +279,11 @@ extern "C" __global__ void dsv41_metadata(int32_t* req,int32_t* pos,int64_t* slo
  else if(phase==2){seq=row/keep;int end=cu[seq+1],n=min(keep,end-cu[seq]),i=row%keep;kept=n>0&&i>=keep-n;source=max(end-keep+i,end-max(n,1));floor=input_pos[end-max(n,1)];}
  else {int lo=0,hi=seqs;while(lo+1<hi){int mid=(lo+hi)/2;if(cu[mid]<=row)lo=mid;else hi=mid;}seq=lo;source=row;}
  bool live=kept&&valid[source]!=0;req[row]=seq;pos[row]=input_pos[source];slots[row]=live?input_slots[source]:-1;mask[row]=live;
- window_slots[row]=live?ring_slot(window_lines,seq,input_pos[source],ring):-1;
+ // Only the last `window` positions of a step reach the state ring; earlier
+ // rows would race for the same slot.
+ window_slots[row]=live&&input_pos[source]>=seq_lens[seq]-128?ring_slot(window_lines,seq,input_pos[source],ring):-1;
+ int start=phase==1?seq*5:phase==2?seq*keep:cu[seq],first=phase==2?floor:input_pos[cu[seq]];
+ work_slots[row]=live?(int64_t)WINDOW_PREFIX*(seq+1)+start+(input_pos[source]-first):-1;
  ids32[row]=(int32_t)ids[phase==1?row:source];ends[row]=seq_lens[seq]-(phase==1?1:0);window_length[row]=live?(phase==1?min(seq_lens[seq]-1,133):min(input_pos[source]-floor+1,128)):0;compressed_length[row]=live?512:0;source_rows[row]=source;}
  if(row<seqs){bool live=valid[cu[row]]!=0;int count=cu[row+1]-cu[row];starts[row]=phase==1?row*5:phase==2?row*keep:cu[row];seq_valid[row]=live;counts[row]=live?(phase==1?5:phase==2?min(keep,count):count):0;}
  if(row==0)starts[seqs]=rows;
