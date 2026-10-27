@@ -46,6 +46,7 @@ def main():
         ("decode", [0,1,2,3], [0,129,500], [1,0,1]),
         ("verify", [0,6,12,18], [127,0,255], [1,0,1]),
         ("draft", [0,6,12,18], [127,0,255], [1,0,1]),
+        ("prefill", [0,300], [0], [1]),
     ]:
         seqs = len(bases)
         positions = sum([list(range(base,base+starts_in[i+1]-starts_in[i])) for i,base in enumerate(bases)],[])
@@ -60,10 +61,10 @@ def main():
         req,pos,slot,mask = alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int64),alloc(rows,torch.uint8)
         # Window rings live in per-sequence slots; the line table holds the slot.
         ring,lines=256,tensor([5,2,9][:seqs])
-        wslot=alloc(rows,torch.int64)
+        wslot,work=alloc(rows,torch.int64),alloc(rows,torch.int64)
         starts,live,ends,ids32,counts = alloc(seqs+1,torch.int32),alloc(seqs,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(seqs,torch.int32)
         winlen,complen,source=alloc(rows,torch.int32),alloc(rows,torch.int32),alloc(rows,torch.int32)
-        launch("dsv41_metadata",(rows+255)//256,req,pos,slot,wslot,mask,starts,live,ends,ids32,counts,winlen,complen,source,
+        launch("dsv41_metadata",(rows+255)//256,req,pos,slot,wslot,work,mask,starts,live,ends,ids32,counts,winlen,complen,source,
             src_pos,src_slots,src_valid,ids,cu_in,lens,lines,rows,seqs,draft,ring,0)
         selection = [starts_in[s]+j for s in range(seqs) for j in range(5)] if draft else list(range(rows))
         expected_pos = tensor([positions[i] for i in selection])
@@ -71,7 +72,23 @@ def main():
         expected_slot = tensor([slots[i] if valid[i] else -1 for i in selection],torch.int64)
         assert torch.equal(pos,expected_pos) and torch.equal(slot,expected_slot) and torch.equal(mask,expected_valid)
         assert torch.equal(source,tensor(selection))
-        assert torch.equal(wslot,torch.where(mask.bool(),lines[req.long()].long()*ring+pos%ring,-1))
+        assert torch.equal(wslot,torch.where(mask.bool()&(pos>=lens[req.long()]-128),lines[req.long()].long()*ring+pos%ring,-1))
+        first=pos[starts[:-1][req.long()].long()]
+        expected_work=torch.where(mask.bool(),256*(req.long()+1)+starts[:-1][req.long()].long()+(pos-first).long(),-1)
+        assert torch.equal(work,expected_work)
+        # The work prefix receives the ring's 128 positions before a sequence's first row.
+        page=128;stride=page*528
+        state=(torch.arange(10*ring*528,device="cuda")%251).to(torch.uint8)
+        area=torch.full(((256*seqs+rows+page-1)//page*stride,),0xEE,device="cuda",dtype=torch.uint8)
+        launch("dsv41_window_load",seqs,area,state,lines,starts,pos,live,seqs,128,ring,page)
+        def fp8_row(cache,s):
+            base=(s//page)*stride;t=s%page
+            return torch.cat([cache[base+t*512:base+t*512+512],cache[base+page*512+t*16:base+page*512+t*16+16]])
+        for seq in range(seqs):
+            if not active[seq]:continue
+            anchor=int(first[starts[seq]])
+            for p in range(max(0,anchor-128),anchor):
+                assert torch.equal(fp8_row(area,256*(seq+1)+int(starts[seq])+p-anchor),fp8_row(state,int(lines[seq])*ring+p%ring)),(mode,seq,p)
         assert torch.equal(ids32,ids.int())
         assert torch.equal(winlen,torch.where(mask.bool(),torch.minimum(ends if draft else pos+1,torch.full_like(pos,133 if draft else 128)),0))
         assert torch.equal(complen,torch.where(mask.bool(),512,0).int())
@@ -84,7 +101,7 @@ def main():
         page_table=torch.arange(seqs*page_cols,device="cuda",dtype=torch.int32).reshape(seqs,page_cols)+37
         if draft and reference_topk:
             window=alloc((rows,192),torch.int32)
-            launch("dsv41_window_indices",rows,window,req,pos,ends,winlen,lines,rows,128,192,ring,1,5)
+            launch("dsv41_window_indices",rows,window,req,pos,ends,winlen,starts,rows,128,192,1,5)
             for row in range(rows):
                 seq=int(req[row]);anchor=bases[seq]
                 if not active[seq] or anchor<=1:continue
@@ -95,7 +112,7 @@ def main():
                     else:
                         absolute=(anchor-1)//128*128+index
                         logical.append(absolute if absolute<anchor else absolute-128)
-                physical=[int(lines[seq])*ring+p%ring for p in logical]
+                physical=[256*(seq+1)+5*seq+p-anchor for p in logical]
                 assert sorted(window[row][window[row]>=0].tolist())==sorted(physical)
                 assert int(winlen[row])==len(original)
             print("draft RoPE positions and window visibility match official DSpark indices")
@@ -119,7 +136,7 @@ def main():
         assert torch.equal(cslot,torch.where(complete,slot//2,-1))
         assert torch.equal(cpos,torch.where(complete,pos-1,0))
         history=torch.full((2048,),-777,device="cuda",dtype=torch.int64);expected=history.clone()
-        remap=torch.arange(64,device="cuda",dtype=torch.int64)
+        remap=torch.arange(max(64,rows),device="cuda",dtype=torch.int64)
         launch("dsv41_history",(rows+255)//256,history,ids32,slot,remap,mask,rows)
         expected[slot[mask.bool()]]=ids32[mask.bool()].long()
         assert torch.equal(history,expected)

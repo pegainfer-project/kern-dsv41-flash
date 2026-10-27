@@ -50,17 +50,16 @@ def forward(pieces, serving, layer, layouts, source, output, *,
         rope("q_rope",prefix+".q",prefix+".q_rotated",64,0)
     layer_id = int(layer.rsplit(".",1)[1])
     calls += serving.window_write(mode,layer_id,prefix+".kv_rotated")
-    window = f"{'draft' if mode == 'draft' else 'target'}.window.{layer_id}"
+    work = buf("window.work")
     # Empty extra branch still has ABI arguments, never dereferenced with k=0.
     extra = compressed or {
-        "state":window,"indices":mode+".window_indices","lengths":mode+".window_length",
-        "ratio":1,"width":0,
+        "indices":mode+".window_indices","lengths":mode+".window_length","ratio":1,"width":0,
     }
     builder = fused_definitions if fused else paged_definitions
     modules,ops = builder(
-        fused_cubin if fused else attention_cubin,rows=rows,rows_max=capacity,pages=pool_tokens//page,
+        fused_cubin if fused else attention_cubin,rows=rows,rows_max=capacity,pages=serving.layout.work_rows//page,
         extra_pages=pool_tokens//page,page_size=page,extra_page_size=page//extra["ratio"],
-        topk=192 if mode == "draft" else 128,extra_topk=extra["width"])
+        topk=192 if mode == "draft" else 128,extra_topk=extra["width"],cache_state=compressed is not None)
     entry = "dsv41_fused_attention" if fused else "dsv41_paged_attention"
     if fused:
         # The byte ABI holds packed E8M0 words; expose I32 storage so O-A
@@ -70,9 +69,9 @@ def forward(pieces, serving, layer, layouts, source, output, *,
     raw = prefix+".attention_raw"
     buffers[raw] = {"dtype":"fp8e4m3" if fused else "bf16","kind":"workspace","shape":[capacity,32768]}
     args = [
-        buf(prefix+".q" if fused else prefix+".q_rotated"),{"state":window},
+        buf(prefix+".q" if fused else prefix+".q_rotated"),work,
         buf(mode+".window_indices"),buf(mode+".window_length"),
-        buf(layer+".attn.attn_sink"),buf(raw),{"state":extra["state"]},
+        buf(layer+".attn.attn_sink"),buf(raw),{"state":extra["state"]} if compressed else work,
         buf(extra["indices"]),buf(extra["lengths"]),scalar(rows),
     ]
     if fused:

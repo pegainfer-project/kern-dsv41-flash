@@ -14,11 +14,12 @@ def definitions(cubin, *, rows, rows_max, pages, extra_pages, page_size=64,
     """Return modules,ops. Params Q,cache,ids,lengths,sink,O,extra,extra_ids,extra_lengths,rows.
 
     Q/O BF16[rows,64,512], ids i32[rows,topk], lengths i32[rows], sink f32[64].
-    Extra indices/lengths follow the same contract. Cache is opaque state:
-    per page FP8 data[page_size,512] then E8M0 scale[page_size,16]; compressed
-    FP4 data[page_size,256] then E4M3 scale[page_size,32].
+    Extra indices/lengths follow the same contract. The window cache is a
+    buffer of `pages` pages, per page FP8 data[page_size,512] then E8M0
+    scale[page_size,16]; the compressed cache is opaque state, FP4
+    data[page_size,256] then E4M3 scale[page_size,32].
     Both widths must be multiples of64; extra_topk may be0. Tests use
-    cache_state=False to feed raw bytes as ordinary input buffers.
+    cache_state=False to feed the compressed cache as raw bytes too.
     No split-KV: suitable for batch decode/verify; low-batch split variant pending.
     """
     if topk<64 or topk%64 or extra_topk%64 or extra_topk<0:
@@ -27,7 +28,7 @@ def definitions(cubin, *, rows, rows_max, pages, extra_pages, page_size=64,
     if page_size%32 or extra_page_size%8:
         raise ValueError('FP8 page size multiple32; FP4 page size multiple8')
     cache='in state' if cache_state else 'in buffer<u8>'
-    params=['in buffer<bf16>',cache,'in buffer<i32>','in buffer<i32>','in buffer<f32>',
+    params=['in buffer<bf16>','in buffer<u8>','in buffer<i32>','in buffer<i32>','in buffer<f32>',
             'out buffer<bf16>',cache,'in buffer<i32>','in buffer<i32>','i32']
     f=[{'at':0,'param':9}]
     values={4:1,8:64,12:1,16:512,20:512,32:pages,36:page_size,40:topk,44:2,48:3,
@@ -50,7 +51,7 @@ def definitions(cubin, *, rows, rows_max, pages, extra_pages, page_size=64,
         return {'at':at,'tensormap':{'param':param,'dtype':dtype,'dims':dims,'strides':strides,'box':box,'swizzle':swizzle,'l2_promotion':128}}
     t += [tm(128,0,'bf16',[512,64,1,rows_max],[1024,65536,65536],[64,64,1,1],128),
           tm(512,5,'bf16',[512,64,1,rows_max],[1024,65536,65536],[64,64,1,1],128),
-          tm(896,1,'u32',[128,0 if cache_state else pages*page_size*528//512],[512],[128,1],0)]
+          tm(896,1,'u32',[128,pages*page_size*528//512],[512],[128,1],0)]
     if extra_topk:
         t += [tm(1152,6,'u32',[64,0 if cache_state else extra_pages*extra_page_size*288//256],[256],[72,1],0)]
     cubin=Path(cubin)

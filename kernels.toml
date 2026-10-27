@@ -67,7 +67,7 @@ sha256 = "ac0a69424924e3329368fc5bc97d6dcea5df56bf402cf3eababbf2d969177fbe"
 [kernels.dsv41_auxiliary]
 source = "source/auxiliary/auxiliary.cu"
 flags = "nofma"
-sha256 = "176d1d9b68a626657275279b7b87bf2df349d9b538f7cddd1eba96149c7ba8ba"
+sha256 = "ac1032271d7ef680ff5fe21e8a346c7a482d433d9d6cca28ac1a2c81a95db00d"
 
 [kernels.dsv41_engram_peers]
 source = "source/auxiliary/engram_peers.cu"

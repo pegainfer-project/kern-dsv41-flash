@@ -50,8 +50,8 @@ class Layout:
     def __post_init__(self):
         if self.max_seqs < 1 or self.max_tokens < 6 * self.max_seqs:
             raise ValueError("tokens bound must cover six verification rows per sequence")
-        if self.page_size < 32 or self.page_size & (self.page_size - 1):
-            raise ValueError("FlashMLA requires power-of-two pages, at least32 window tokens")
+        if self.page_size < 32 or self.page_size & (self.page_size - 1) or self.page_size > self.ring:
+            raise ValueError("FlashMLA requires power-of-two pages, at least32 window tokens, dividing the window ring")
         if self.max_context % self.page_size:
             raise ValueError("context bound must be a whole number of pages")
         if any(r not in (1, 2) for _, r in self.sources):
@@ -65,10 +65,16 @@ class Layout:
 
     @property
     def ring(self):
-        """Window tokens kept per sequence: the128-token window plus every row one
-        step can write ahead of the oldest read, rounded to whole pages. Draft
-        rounds read133 back and write six, well inside the same bound."""
-        return -(-(128 + self.max_tokens) // self.page_size) * self.page_size
+        """Window positions a sequence carries between steps, addressed by
+        position modulo ring: the 128 a step reads and the 128 it writes
+        last never share a slot."""
+        return 256
+
+    @property
+    def work_rows(self):
+        """Slots of the step's window work area: a ring-sized prefix a
+        sequence, holding the window it carried in, then every row."""
+        return -(-(self.ring * self.max_seqs + self.max_tokens) // self.page_size) * self.page_size
 
 
 @dataclass
@@ -115,7 +121,7 @@ class Serving:
         ids is staged input_ids for plain, verify_ids or draft_ids for the round.
         """
         rows = scalar(self.rows(mode))
-        names = ("request", "position", "slot", "window_slot", "mask", "starts", "seq_valid", "block_end", "ids32", "all_count", "window_length", "compressed_length", "source_rows")
+        names = ("request", "position", "slot", "window_slot", "work_slot", "mask", "starts", "seq_valid", "block_end", "ids32", "all_count", "window_length", "compressed_length", "source_rows")
         phase = {"draft": 1, "replay": 2}.get(mode, 0)
         calls = [self._call(mode, "metadata", "metadata", *(buf(f"{mode}.{n}") for n in names),
             buf("positions"), buf("slot_mapping"), buf("valid"), buf(ids), buf("cu_seqlens"), buf("seq_lens"),
@@ -128,8 +134,8 @@ class Serving:
         width = 192 if mode == "draft" else 128
         calls += [self._call(mode, "window_indices", "window_indices", buf(f"{mode}.window_indices"),
             buf(f"{mode}.request"), buf(f"{mode}.position"), buf(f"{mode}.block_end"),
-            buf(f"{mode}.window_length"), buf("window.lines"),
-            rows, scalar(128), scalar(width), scalar(self.layout.ring), scalar(int(mode == "draft")), scalar(5)),
+            buf(f"{mode}.window_length"), buf(f"{mode}.starts"),
+            rows, scalar(128), scalar(width), scalar(int(mode == "draft")), scalar(5)),
             self._call(mode, "window_mask", "indices_mask", buf(f"{mode}.window_indices"),
                 buf(f"{mode}.mask"), rows, scalar(width))]
         return calls
@@ -166,10 +172,20 @@ class Serving:
             scalar(ranks), {"i64": per_rank}, {"i64": total})]
 
     def window_write(self, mode, layer, post_rope_kv):
-        """Ring writes: window_slot is the row's position modulo the ring inside its sequence's slot."""
+        """The layer's window into `window.work`: the ring's last 128 positions a
+        sequence, then the step's rows; the rows within 128 of a sequence's end
+        also go to the ring, which the draft rows leave to the verification's
+        publication."""
         prefix = "draft" if mode == "draft" else "target"
-        return [self._call(mode, f"window{layer}.write", "cache_fp8", state(f"{prefix}.window.{layer}"),
-            buf(post_rope_kv), buf(f"{mode}.window_slot"), scalar(self.rows(mode)), scalar(self.layout.page_size))]
+        rows, page = scalar(self.rows(mode)), scalar(self.layout.page_size)
+        calls = [self._call(mode, f"window{layer}.load", "window_load", buf("window.work"), state(f"{prefix}.window.{layer}"),
+            buf("window.lines"), buf(f"{mode}.starts"), buf(f"{mode}.position"), buf(f"{mode}.seq_valid"),
+            scalar("seqs"), scalar(128), scalar(self.layout.ring), page),
+            self._call(mode, f"window{layer}.write", "work_fp8", buf("window.work"), buf(post_rope_kv), buf(f"{mode}.work_slot"), rows, page)]
+        if mode != "draft":
+            calls.append(self._call(mode, f"window{layer}.keep", "cache_fp8", state(f"{prefix}.window.{layer}"),
+                buf(post_rope_kv), buf(f"{mode}.window_slot"), rows, page))
+        return calls
 
     def compressor(self, mode, source, projected_kv, projected_score, norm_weight, output):
         """Projected f32 KV/score must survive until the accepted commit.
@@ -276,6 +292,7 @@ def build(cubin: Path, layout=Layout(), peers=None):
         # slot, shared by every window state of the lease.
         "window.lines": {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                          "domain": {"index_into": "target.window.0", "stride": layout.ring * 528}},
+        "window.work": {"kind": "workspace", "dtype": "u8", "shape": [layout.work_rows, 528]},
     }
     states = {"engram_history": {"bytes_per_token": 8}}
     for prefix, count in (("target", layout.target_layers), ("draft", layout.draft_layers)):
@@ -296,7 +313,7 @@ def build(cubin: Path, layout=Layout(), peers=None):
         modules.update(mods)
         all_ops.update({f"{mode}.{name}": op for name, op in ops.items()})
         shapes = {"request": ("i32", ["tokens"]), "position": ("i32", ["tokens"]),
-            "slot": ("i64", ["tokens"]), "window_slot": ("i64", ["tokens"]), "mask": ("u8", ["tokens"]), "starts": ("i32", [layout.max_seqs + 1]),
+            "slot": ("i64", ["tokens"]), "window_slot": ("i64", ["tokens"]), "work_slot": ("i64", ["tokens"]), "mask": ("u8", ["tokens"]), "starts": ("i32", [layout.max_seqs + 1]),
             "seq_valid": ("i32", ["seqs"]), "block_end": ("i32", ["tokens"]), "ids32": ("i32", ["tokens"]),
             "window_length": ("i32", ["tokens"]), "compressed_length": ("i32", ["tokens"]),
             "all_count": ("i32", ["seqs"]), "commit_count": ("i32", ["seqs"]), "source_rows": ("i32", ["tokens"]),
