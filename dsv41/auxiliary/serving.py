@@ -15,6 +15,14 @@ from pathlib import Path
 from .ops import definitions
 
 
+ENGRAM = (1, 14)
+
+
+def history(layer):
+    """The paged token history Engram layer `layer` hashes its n-grams over."""
+    return f"engram_history.{layer}"
+
+
 def index_page_stride(page_size):
     """DeepGEMM TMA requires whole index pages aligned to512 bytes."""
     return (page_size * 68 + 511) // 512 * 512
@@ -140,18 +148,21 @@ class Serving:
                 buf(f"{mode}.mask"), rows, scalar(width))]
         return calls
 
-    def engram_hash(self, mode, *, token_map, multipliers, primes, offsets, compressed_pad_id):
-        """Constants are supplied by the caller from the official tokenizer/layout.
+    def engram_hash(self, mode, layer, *, token_map, multipliers, primes, offsets, compressed_pad_id):
+        """The n-gram hashes Engram layer `layer` looks up, over its own token history.
 
+        Each Engram layer keeps its own history state, so no hash or history
+        crosses from one layer to another (a pipeline stage holds either).
+        Constants are supplied by the caller from the official tokenizer/layout.
         Token map int64[vocab], multipliers int64[2,4], primes/offsets int64[2,24].
         Do not substitute raw vocabulary size for compressed vocabulary size.
         """
-        if mode == "draft":
-            raise ValueError("draft layers have no Engram")
+        if mode == "draft" or layer not in ENGRAM:
+            raise ValueError("Engram only appears in target layers 1 and 14")
         rows = scalar(self.rows(mode))
-        return [self._call(mode, "history", "engram_history", state("engram_history"),
+        return [self._call(mode, f"history{layer}", "engram_history", state(history(layer)),
             buf(f"{mode}.ids32"), buf(f"{mode}.slot"), buf(token_map), buf(f"{mode}.mask"), rows),
-            self._call(mode, "hash", "engram_hash", buf(f"{mode}.hashes"), state("engram_history"),
+            self._call(mode, f"hash{layer}", "engram_hash", buf(f"{mode}.hashes"), state(history(layer)),
                 buf(f"{mode}.request"), buf(f"{mode}.position"), buf("page_table"),
                 buf(multipliers), buf(primes), buf(offsets), rows, scalar(self.layout.page_size),
                 scalar(self.layout.pages), scalar(2), scalar(8), scalar(4), {"i64": compressed_pad_id})]
@@ -283,18 +294,18 @@ def build(cubin: Path, layout=Layout(), peers=None):
         "positions": {"kind": "input", "dtype": "i32", "shape": ["tokens"], "fill": "position"},
         "valid": {"kind": "input", "dtype": "i32", "shape": ["tokens"], "fill": "valid"},
         "slot_mapping": {"kind": "input", "dtype": "i64", "shape": ["tokens"], "fill": "slot",
-                         "domain": {"index_into": "engram_history"}},
+                         "domain": {"index_into": history(ENGRAM[0])}},
         "seq_lens": {"kind": "input", "dtype": "i32", "shape": ["seqs"], "fill": "seq_len"},
         "cu_seqlens": {"kind": "input", "dtype": "i32", "shape": [layout.max_seqs + 1], "fill": "cu_seqlens"},
         "page_table": {"kind": "input", "dtype": "i32", "shape": ["seqs", layout.pages],
-                       "domain": {"index_into": "engram_history", "stride": layout.page_size}},
+                       "domain": {"index_into": history(ENGRAM[0]), "stride": layout.page_size}},
         # One line per sequence, the whole ring: the value is the sequence's
         # slot, shared by every window state of the lease.
         "window.lines": {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                          "domain": {"index_into": "target.window.0", "stride": layout.ring * 528}},
         "window.work": {"kind": "workspace", "dtype": "u8", "shape": [layout.work_rows, 528]},
     }
-    states = {"engram_history": {"bytes_per_token": 8}}
+    states = {history(layer): {"bytes_per_token": 8} for layer in ENGRAM}
     for prefix, count in (("target", layout.target_layers), ("draft", layout.draft_layers)):
         states.update({f"{prefix}.window.{layer}": {"bytes_per_seq": layout.ring * 528} for layer in range(count)})
     for source, ratio in layout.sources:

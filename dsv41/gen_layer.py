@@ -16,6 +16,7 @@ from dsv41.blocks import Blocks
 from dsv41.attention_forward import forward as attention
 from dsv41.forward import fp8_input
 from dsv41.moe_forward import forward as moe, fp8_input as moe_fp8_input
+from dsv41.auxiliary.serving import ENGRAM, history
 from dsv41.auxiliary.serving import build,Layout
 
 
@@ -64,9 +65,9 @@ def generate(raw, *, cubin_dir, auxiliary_cubin, attention_cubin, capacity=128, 
     buffers={n:b for n,b in buffers.items() if n in used}
     # A layer without Engram uses its window pool as the canonical slot domain.
     for spec in buffers.values():
-        if spec.get("domain",{}).get("index_into") == "engram_history":
+        if spec.get("domain",{}).get("index_into") == history(ENGRAM[0]):
             spec["domain"]["index_into"] = "target.window.0"
-    aux["states"].pop("engram_history",None)
+    aux["states"].pop(history(ENGRAM[0]),None)
     used_ops = {c["op"] for p in programs.values() for c in p["calls"]}
     ops = {n:o for n,o in {**pieces.ops,**aux["ops"]}.items() if n in used_ops}
     used_modules = {l["module"] for o in ops.values() for l in o["impl"]["launches"] if "module" in l}

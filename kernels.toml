@@ -108,6 +108,12 @@ flags = "deepgemm"
 includes = "mega-moe"
 sha256 = "4b17306a4d95137ac830fe16df58a87db35f83b0f3390437df2a5aaba65d84d4"
 
+[kernels.dsv41_mega_moe_local]
+source = "source/moe/mega_moe_local.cu"
+flags = "deepgemm"
+includes = "mega-moe"
+sha256 = "63f06de605a6884269c2e2a21b00e2be6e49740a7f6afaedd44602a63b97fc47"
+
 [kernels.dsv41_moe_stage]
 source = "source/moe/stage.cu"
 flags = "plain"
@@ -158,11 +164,11 @@ flags = "default"
 sha256 = "83a1cd23bb15864787adb483d4a8b0737fb2c1c4d3a875750306d9a0f1ac0b8a"
 
 # The MegaMoE ring is sized from the pool its persistent grid drains: one
-# layout per expert count and SM count the cubin carries an instance for.
+# layout per expert count, rank count and SM count a cubin carries an instance for.
 [layouts]
 tool = "source/moe/moe_layout.cu"
 flags = "deepgemm"
 includes = "deepgemm"
-# (experts, most tokens a rank feeds one call): the draft MoE decodes only.
-instances = [[128, 8192], [384, 8192], [384, 32768]]
+# (experts, ranks, most tokens a rank feeds one call): the draft MoE decodes only.
+instances = [[128, 4, 8192], [384, 4, 8192], [384, 4, 32768], [128, 1, 8192], [384, 1, 8192], [384, 1, 32768]]
 sms = [148, 152]

@@ -47,6 +47,22 @@ else in the two manifests is identical; both need the peer memory below, which
 the runtime provides over fabric handles where the device has them and over
 local allocation handles otherwise. About 47 GiB more HBM per rank.
 
+`--ranks 1` builds the model for one GPU: experts and Engram tables whole in
+its HBM, MegaMoE over one rank, barriers and slabs as workspaces cleared where
+they are first used. It exists to be cut into pipeline stages, so it goes with
+`--prefill-only`; `--stages 8,14,20` names the layers a stage starts at, and
+each of those layers then rebuilds the prefill metadata and the mHC identity
+the stage before it would otherwise have to hand over. A stage boundary sits
+on a compressor group (layers 2, 8, 14, 20 start one), since a compressor's
+state is written by the group's first layer and read by the rest:
+
+```bash
+python3 dsv41/gen.py --checkpoint "$CHECKPOINT" --engram device --ranks 1 \
+  --stages 8,14,20 --prefill-only --replay 140 --sms 152 \
+  --capacity 32768 --max-seqs 56 --context 1048576 --out r1.json --bundle model-cubins
+kern cut r1.json --at <indices of every prefill.metadata call but the first> --out stages/
+```
+
 `--capacity` bounds live rows, including six verification rows per sequence;
 `--context` bounds each sequence's logical page table (default the model's
 1M tokens; the bound costs a few MB of page tables, the tokens themselves

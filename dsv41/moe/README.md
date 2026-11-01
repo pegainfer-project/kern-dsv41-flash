@@ -8,10 +8,13 @@ count is a template parameter and the launch grid. An instance built for more
 SMs than the device has waits for CTAs that never become resident, which the
 driver ends as a grid sync timeout. Each cubin therefore carries one instance
 per device kern serves — GB300 152, B300 148 — and `gen.py --sms` picks the
-set the manifest pins, together with the matching `moe_layout_<E>_sm<N>_t<T>.json`
+set the manifest pins, together with the matching `moe_layout_<E>_r<R>_sm<N>_t<T>.json`
 (the MoE ring is sized from the pool the persistent grid drains, so each
 instance also carries the most rows `T` a rank feeds it; `gen.py --capacity`
-picks the smallest that holds the capacity).
+picks the smallest that holds the capacity). The rank count `R` is a template
+parameter too: `dsv41_mega_moe` holds the EP4 instances, `dsv41_mega_moe_local`
+the one-rank ones, whose dispatch never leaves the GPU, and `dsv41_slab_init`,
+which clears a one-rank slab's signals and points its peer table at itself.
 `scripts/build.py` builds them, with the layouts, into the ignored `build/`.
 
 * `ops.pieces(rows=...)`: small boundary operations. SwiGLU's final scalar is the element count, unlike HC operations' token count. Uses training clamp 10 (gate upper-only, up bilateral).
