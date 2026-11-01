@@ -22,8 +22,8 @@ def main():
  buffers.update({n:raw[n] for n in used-buffers.keys()})
  for name in (stage.latent,'prefill.compress2.key_dequant'):buffers[name]['kind']='output'
  for value in buffers.values():
-  if value.get('domain',{}).get('index_into')=='engram_history':value['domain']['index_into']='compressed.2'
- aux['states'].pop('engram_history',None)
+  if value.get('domain',{}).get('index_into')=='engram_history.1':value['domain']['index_into']='compressed.2'
+ aux['states'].pop('engram_history.1',None)
  modules={**pieces.modules,**aux['modules']};ops={**pieces.ops,**aux['ops']}
  manifest={'schema_version':SCHEMA_VERSION,'model':'compressor-publish-integration','vars':aux['vars'],'states':aux['states'],'buffers':buffers,'modules':modules,'ops':ops,'programs':programs}
  index=json.loads((a.checkpoint/'model.safetensors.index.json').read_text())['weight_map']

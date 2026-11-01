@@ -10,7 +10,7 @@ from .compression import publish
 from .engram import inject
 from .forward import Lowered, fp8_input, normalize, scalar, selected
 from .head import definitions as head_ops
-from .moe_forward import forward as moe, fp8_input as moe_fp8_input
+from .moe_forward import forward as moe, fp8_input as moe_fp8_input, init as moe_init
 from .programs import buf, call, integer
 
 
@@ -29,7 +29,7 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, mode, ids,
             capacity, pool_tokens, constants, cubin_dir, auxiliary_cubin,
             attention_cubin, head_cubin, dense_cubin, sparse_cubin, select_cubin,
             candidate_cubin, capture_tap, fused_cubin=None, engram=None, device_sms=152,
-            replay_capacity=None, copy_cubin=None):
+            replay_capacity=None, copy_cubin=None, ranks=4, stages=(), clears=()):
     """Produce all token hidden rows; the caller chooses serving head rows.
 
     capture_tap(layer,materialized_hc,mode,capacity) returns a Lowered stage
@@ -44,12 +44,16 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, mode, ids,
     projection (layer 20's compressor and index keys over its attention
     input), then only each sequence's replay rows run the decoder, in
     `replay` mode, and the hidden rows handed back are theirs.
+
+    At one rank (`ranks=1`) each layer in `stages` starts a pipeline stage:
+    there the metadata and the identity mixes are computed again and the
+    barriers cleared (`clears`), so a stage reads nothing from the stages
+    before it but the mHC stream, and each stage's MoE slab is scratch of its
+    own, cleared before its first MoE.
     """
     if mode not in ("prefill", "decode", "verify"):
         raise ValueError("target mode must be prefill, decode or verify")
     buffers, calls = {}, serving.prepare(mode,ids)
-    calls += serving.engram_hash(mode,**constants["names"],
-                                  compressed_pad_id=constants["metadata"]["compressed_pad_id"])
     commits = []
 
     def extend(stage):
@@ -70,6 +74,8 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, mode, ids,
         return m, serving.rows(m), cap, blocks, compressed
 
     m, rows, cap, blocks, compressed = stage(mode, capacity)
+    calls.extend(clears if ranks == 1 else [])
+    cleared = set()
     embedding = m + ".target.embedding"
     buffers[embedding] = {"dtype":"bf16","kind":"workspace","shape":[capacity,5120]}
     embedding_op = pieces.add(selected(head_ops(head_cubin,seqs=rows),"head_embedding"))["head_embedding"]
@@ -99,13 +105,21 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, mode, ids,
 
     for layer_id in range(40):
         layer = f"layers.{layer_id}"
+        if ranks == 1 and layer_id in stages:
+            calls.extend(serving.prepare(m,ids)+blocks.identity()+list(clears))
+            cleared = set()
         if layer_id == DECODER and mode == "prefill" and serving.layout.replay:
             commits += compressed.commits
             state, (m, rows, cap, blocks, compressed) = replay(state, blocks)
         prefix = m + ".target"
+        if ranks == 1 and m not in cleared:
+            extend(moe_init(pieces,prefix+".moe",rows=rows,capacity=cap,cubin_dir=cubin_dir,device_sms=device_sms))
+            cleared.add(m)
         if layer_id in (1,14):
             state, flush = blocks.materialize(state,prefix+f".{layer}.engram_materialize")
             calls.extend(flush)
+            calls.extend(serving.engram_hash(mode,layer_id,**constants["names"],
+                                             compressed_pad_id=constants["metadata"]["compressed_pad_id"]))
             output = prefix + ".engram_residual"
             extend(inject(pieces,serving,layer_id,dense_layouts,state.residual,output,
                           mode=m,capacity=cap,cubin_dir=cubin_dir,
@@ -128,11 +142,11 @@ def forward(pieces, serving, dense_layouts, expert_layouts, *, mode, ids,
 
         def ffn(source, output):
             return moe(pieces,layer,expert_layouts,source,output,rows=rows,capacity=cap,
-                       workspace=prefix+".moe",cubin_dir=cubin_dir,device_sms=device_sms)
+                       workspace=prefix+".moe",cubin_dir=cubin_dir,device_sms=device_sms,ranks=ranks)
 
         state, lowered = blocks.layer(state,layer,attn,ffn,
                                       attention_fp8=fp8_input(prefix+".attention",cap)[1],
-                                      ffn_fp8=moe_fp8_input(prefix+".moe",capacity=cap,cubin_dir=cubin_dir,rows=rows,device_sms=device_sms))
+                                      ffn_fp8=moe_fp8_input(prefix+".moe",capacity=cap,cubin_dir=cubin_dir,rows=rows,device_sms=device_sms,ranks=ranks))
         extend(lowered)
 
     collapsed, normalized = m+".target.collapsed", m+".target.head_hidden"

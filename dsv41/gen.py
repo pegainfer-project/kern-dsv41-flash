@@ -1,6 +1,12 @@
 """Generate DeepSeek V4.1 Flash's serving manifest: load, prefill, batch decode and the
 five-draft/six-verify round, over the cubins `scripts/build.py` and
-`engram_constants.py` write into one directory as `<module>.cubin`."""
+`engram_constants.py` write into one directory as `<module>.cubin`.
+
+`--ranks 4` is one process's DP4/EP4 programs; `--ranks 1` holds every expert
+on one rank, a manifest without a topology that `kern cut` splits into
+pipeline stages. Either way the experts' raw gate/up weights and scales are
+`source`s, read only by the `derive` program that packs them while the
+weights load, so a GPU never holds both copies."""
 import argparse
 import json
 from pathlib import Path
@@ -52,7 +58,7 @@ def engram_shards(raw):
     return shards
 
 
-def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=32768, device_sms=152, prefill_only=False, replay=0):
+def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=32768, device_sms=152, prefill_only=False, replay=0, ranks=4, stages=()):
     cubin = lambda module: kernels/f"{module}.cubin"
     cubin_dir, auxiliary_cubin, head_cubin = kernels, cubin("dsv41_auxiliary"), cubin("dsv41_head")
     fused_cubin = cubin("dsv41_fused_decode")
@@ -61,13 +67,14 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
                    if b.get("placement") != "host" and b["kind"] == "weight" and ".engram.embed." not in name}
     dense_buffers, dense_load, dense_layouts = dense_scales(projections,pieces,cubin_dir=cubin_dir,fused_attention=True)
     expert_buffers, expert_load, expert_layouts = expert_weights(projections,pieces,cubin_dir=cubin_dir)
-    barrier_buffers, barrier_load = barriers(pieces,cubin_dir=cubin_dir)
+    barrier_buffers, clears = barriers(pieces,cubin_dir=cubin_dir,kind="carry" if ranks > 1 else "workspace")
     engram = engram_shards(raw)
-    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context,replay=replay),
+    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context,replay=replay,
+                                           pipelined=bool(stages)),
                     peers=cubin("dsv41_engram_peers") if engram else None)
     buffers = {**dense_buffers,**expert_buffers,**barrier_buffers,**constants["buffers"]}
     pieces.fixed((constants["modules"],constants["ops"]))
-    programs = {"load":{"once":True,"calls":constants["calls"]+dense_load+expert_load+barrier_load}}
+    load = constants["calls"]+dense_load+(clears if ranks > 1 else [])
     vocab = raw["embed.weight"]["shape"][0]
     buffers["next_token"] = {"kind":"output","dtype":"i64","shape":["seqs"],
                               "fill":"tokens","domain":{"index_into":"embed.weight"}}
@@ -85,7 +92,8 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
                          capture_tap=lambda layer,hc,m,cap: capture(pieces,hc,layer,mode=m,rows=serving.rows(m),
                                                                     capacity=cap,auxiliary_cubin=auxiliary_cubin),
                          engram=engram,device_sms=device_sms,
-                         replay_capacity=(max_seqs*replay+3)//4*4,copy_cubin=cubin("copy_rows"))
+                         replay_capacity=(max_seqs*replay+3)//4*4,copy_cubin=cubin("copy_rows"),
+                         ranks=ranks,stages=stages,clears=clears)
         output = head(pieces,target.normalized,"verify_tokens" if mode=="verify" else "next_token",mode=mode,capacity=rows[mode],max_seqs=max_seqs,vocab=vocab,
                       head_cubin=head_cubin,copy_cubin=cubin("copy_rows"),starts=target.starts)
         replayed = mode == "prefill" and replay
@@ -100,7 +108,8 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
         commits.extend(target.commit)
     draft = draft_forward(pieces,serving,dense_layouts,expert_layouts,max_seqs=max_seqs,pool_tokens=context,
                           constants=constants,cubin_dir=cubin_dir,auxiliary_cubin=auxiliary_cubin,
-                          attention_cubin=None,fused_cubin=fused_cubin,head_cubin=head_cubin,vocab=vocab,device_sms=device_sms)
+                          attention_cubin=None,fused_cubin=fused_cubin,head_cubin=head_cubin,vocab=vocab,device_sms=device_sms,
+                          ranks=ranks,clears=clears)
     buffers.update(draft.buffers)
     for name,kind,width in (("draft_ids","workspace",5),("verify_ids","workspace",6),
                             ("draft_tokens","workspace",5),("verify_tokens","output",6)):
@@ -112,18 +121,22 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
     spec = cubin("dsv41_spec_round")
     pieces.fixed(({"dsv41_spec_round":{"source":spec.name,"sha256":hashlib.sha256(spec.read_bytes()).hexdigest()}},
                   spec_ops("dsv41_spec_round")))
-    programs = assemble(Stages(programs["load"]["calls"],forwards["prefill"],forwards["decode"],draft.calls,
+    programs = assemble(Stages(load,forwards["prefill"],forwards["decode"],draft.calls,
                                forwards["verify"],contexts["prefill"],contexts["decode"],contexts["verify"],commits),
                         max_seqs=max_seqs)
     if prefill_only:
         programs = {name:programs[name] for name in ("load","prefill")}
+    read = {a["buf"] for p in programs.values() for c in p["calls"] for a in c["args"] if "buf" in a}
+    programs["derive"] = {"derive":True,"calls":[c for c in expert_load if c["args"][0]["buf"] in read]}
     aux = serving.pieces(programs)
     buffers.update(aux["buffers"])
     for name in {"input_ids","anchor_token"} & buffers.keys():
         buffers[name] = {**buffers[name],"domain":{"index_into":"embed.weight"}}
     used = {a["buf"] for p in programs.values() for c in p["calls"] for a in c["args"] if "buf" in a}
+    derived = {a["buf"] for c in programs["derive"]["calls"] for a in c["args"] if "buf" in a}
+    elsewhere = {a["buf"] for n,p in programs.items() if n != "derive" for c in p["calls"] for a in c["args"] if "buf" in a}
     for name in sorted(used - buffers.keys()):
-        buffers[name] = raw[name]
+        buffers[name] = dict(raw[name],kind="source") if name in derived - elsewhere else raw[name]
     for b in list(buffers.values()):
         if b.get("of") in raw:
             used.add(b["of"])
@@ -141,7 +154,7 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
             raise ValueError(f"module changed during generation: {name}")
         modules[name] = module
     return {"schema_version":SCHEMA_VERSION,"model":"DeepSeek-V4.1-Flash",
-            "topology":{"groups":{"ep":4}},"vars":aux["vars"],"states":aux["states"],
+            **({"topology":{"groups":{"ep":ranks}}} if ranks > 1 else {}),"vars":aux["vars"],"states":aux["states"],
             "buffers":{name:b for name,b in buffers.items() if name in used},
             "modules":{name:m for name,m in modules.items() if name in used_modules},
             "ops":ops,"programs":programs}
@@ -157,7 +170,11 @@ def main():
     parser.add_argument("--constants",type=Path,help="engram_constants.json (default: in --kernels)")
     parser.add_argument("--out",type=Path,required=True)
     parser.add_argument("--engram",choices=("host","device"),default="host",
-                        help="where the Engram tables live: one copy in host memory (GB300), or sharded into HBM across the EP group (HGX B300)")
+                        help="where the Engram tables live: one copy in host memory (GB300), or in HBM, sharded across the EP group if any (HGX B300, a pipeline stage)")
+    parser.add_argument("--ranks",type=int,default=4,choices=(1,4),
+                        help="EP group size: 4 for one process's DP4/EP4 programs, 1 for every expert on one rank (a manifest `kern cut` splits)")
+    parser.add_argument("--stages",type=lambda s:tuple(int(x) for x in s.split(",")),default=(),
+                        help="with --ranks 1: the layers where pipeline stages start, e.g. 8,14,20; `kern cut` cuts before each one's first call")
     parser.add_argument("--capacity",type=int,default=128)
     parser.add_argument("--max-seqs",type=int,default=16)
     parser.add_argument("--context",type=int,default=1048576,help="page-table bound per sequence, in tokens (the model's 1M)")
@@ -177,7 +194,9 @@ def main():
         if config.get("model_type") != "deepseek_v41":
             parser.error("expected a deepseek_v41 checkpoint")
         tensors, _ = inventory(checkpoint)
-        gpu, host = bind(tensors,config["text_config"],ep=4,engram=engram)
+        if args["stages"] and args["ranks"] != 1:
+            parser.error("--stages cuts a one-rank manifest (--ranks 1)")
+        gpu, host = bind(tensors,config["text_config"],ep=args["ranks"],engram=engram)
         bindings = {"gpu":gpu,"host":host}
     else:
         if engram != "host":

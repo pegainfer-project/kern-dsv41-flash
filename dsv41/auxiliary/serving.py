@@ -15,6 +15,14 @@ from pathlib import Path
 from .ops import definitions
 
 
+ENGRAM = (1, 14)
+
+
+def history(layer):
+    """The paged token history Engram layer `layer` hashes its n-grams over."""
+    return f"engram_history.{layer}"
+
+
 def index_page_stride(page_size):
     """DeepGEMM TMA requires whole index pages aligned to512 bytes."""
     return (page_size * 68 + 511) // 512 * 512
@@ -46,6 +54,7 @@ class Layout:
     draft_layers: int = 3
     sources: tuple = ((2, 2), (8, 2), (14, 2), (20, 1))
     replay: int = 0
+    pipelined: bool = False
 
     def __post_init__(self):
         if self.max_seqs < 1 or self.max_tokens < 6 * self.max_seqs:
@@ -69,6 +78,15 @@ class Layout:
         position modulo ring: the 128 a step reads and the 128 it writes
         last never share a slot."""
         return 256
+
+    @property
+    def compressor_bytes(self):
+        """A compressor's per-sequence state: 4096 bytes, or a whole window
+        line when the manifest is cut into pipeline stages. `kern cut` points
+        a stage's `window.lines` at the first per-sequence state it keeps,
+        which past stage 0 is a compressor's, and a line table's stride
+        must divide its state's bytes per sequence."""
+        return self.ring * 528 if self.pipelined else 4096
 
     @property
     def work_rows(self):
@@ -140,18 +158,21 @@ class Serving:
                 buf(f"{mode}.mask"), rows, scalar(width))]
         return calls
 
-    def engram_hash(self, mode, *, token_map, multipliers, primes, offsets, compressed_pad_id):
-        """Constants are supplied by the caller from the official tokenizer/layout.
+    def engram_hash(self, mode, layer, *, token_map, multipliers, primes, offsets, compressed_pad_id):
+        """The n-gram hashes Engram layer `layer` looks up, over its own token history.
 
+        Each Engram layer keeps its own history state, so no hash or history
+        crosses from one layer to another (a pipeline stage holds either).
+        Constants are supplied by the caller from the official tokenizer/layout.
         Token map int64[vocab], multipliers int64[2,4], primes/offsets int64[2,24].
         Do not substitute raw vocabulary size for compressed vocabulary size.
         """
-        if mode == "draft":
-            raise ValueError("draft layers have no Engram")
+        if mode == "draft" or layer not in ENGRAM:
+            raise ValueError("Engram only appears in target layers 1 and 14")
         rows = scalar(self.rows(mode))
-        return [self._call(mode, "history", "engram_history", state("engram_history"),
+        return [self._call(mode, f"history{layer}", "engram_history", state(history(layer)),
             buf(f"{mode}.ids32"), buf(f"{mode}.slot"), buf(token_map), buf(f"{mode}.mask"), rows),
-            self._call(mode, "hash", "engram_hash", buf(f"{mode}.hashes"), state("engram_history"),
+            self._call(mode, f"hash{layer}", "engram_hash", buf(f"{mode}.hashes"), state(history(layer)),
                 buf(f"{mode}.request"), buf(f"{mode}.position"), buf("page_table"),
                 buf(multipliers), buf(primes), buf(offsets), rows, scalar(self.layout.page_size),
                 scalar(self.layout.pages), scalar(2), scalar(8), scalar(4), {"i64": compressed_pad_id})]
@@ -283,18 +304,18 @@ def build(cubin: Path, layout=Layout(), peers=None):
         "positions": {"kind": "input", "dtype": "i32", "shape": ["tokens"], "fill": "position"},
         "valid": {"kind": "input", "dtype": "i32", "shape": ["tokens"], "fill": "valid"},
         "slot_mapping": {"kind": "input", "dtype": "i64", "shape": ["tokens"], "fill": "slot",
-                         "domain": {"index_into": "engram_history"}},
+                         "domain": {"index_into": history(ENGRAM[0])}},
         "seq_lens": {"kind": "input", "dtype": "i32", "shape": ["seqs"], "fill": "seq_len"},
         "cu_seqlens": {"kind": "input", "dtype": "i32", "shape": [layout.max_seqs + 1], "fill": "cu_seqlens"},
         "page_table": {"kind": "input", "dtype": "i32", "shape": ["seqs", layout.pages],
-                       "domain": {"index_into": "engram_history", "stride": layout.page_size}},
+                       "domain": {"index_into": history(ENGRAM[0]), "stride": layout.page_size}},
         # One line per sequence, the whole ring: the value is the sequence's
         # slot, shared by every window state of the lease.
         "window.lines": {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                          "domain": {"index_into": "target.window.0", "stride": layout.ring * 528}},
         "window.work": {"kind": "workspace", "dtype": "u8", "shape": [layout.work_rows, 528]},
     }
-    states = {"engram_history": {"bytes_per_token": 8}}
+    states = {history(layer): {"bytes_per_token": 8} for layer in ENGRAM}
     for prefix, count in (("target", layout.target_layers), ("draft", layout.draft_layers)):
         states.update({f"{prefix}.window.{layer}": {"bytes_per_seq": layout.ring * 528} for layer in range(count)})
     for source, ratio in layout.sources:
@@ -303,7 +324,7 @@ def build(cubin: Path, layout=Layout(), peers=None):
         states[f"compressed.{source}"] = {"bytes_per_token": 288 // ratio}
         states[f"index_k.{source}"] = {"bytes_per_token": index_page_stride(layout.page_size // ratio) // layout.page_size}
         if ratio == 2:
-            states[f"compressor.{source}"] = {"bytes_per_seq": 4096}
+            states[f"compressor.{source}"] = {"bytes_per_seq": layout.compressor_bytes}
             buffers[f"compressor.{source}.lines"] = {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                 "domain": {"index_into": f"compressor.{source}", "stride": 4096}}
     modules, all_ops = {}, {}

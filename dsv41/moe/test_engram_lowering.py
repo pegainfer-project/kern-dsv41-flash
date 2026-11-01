@@ -26,7 +26,7 @@ def main():
  const=json.loads((a.constants/'engram_constants.json').read_text());pieces=Pieces();serving=build(a.auxiliary_cubin,Layout(max_seqs=2,max_tokens=128,max_context=32768))
  packed,load,layouts=dense_scales({n:v for n,v in weights.items() if v.get("placement")!="host"},pieces,cubin_dir=a.cubin_dir)
  stage=inject(pieces,serving,1,layouts,'residual','output',mode='prefill',capacity=128,cubin_dir=a.cubin_dir)
- programs={'load':{'once':True,'calls':[const['calls'][0]]+load},'probe':{'batch':{'groups':2,'rows':5},'calls':serving.prepare('prefill','input_ids')+serving.engram_hash('prefill',**const['names'],compressed_pad_id=const['metadata']['compressed_pad_id'])+stage.calls}}
+ programs={'load':{'once':True,'calls':[const['calls'][0]]+load},'probe':{'batch':{'groups':2,'rows':5},'calls':serving.prepare('prefill','input_ids')+serving.engram_hash('prefill',1,**const['names'],compressed_pad_id=const['metadata']['compressed_pad_id'])+stage.calls}}
  aux=serving.pieces(programs);buffers={**weights,**packed,**const['buffers'],**aux['buffers'],**stage.buffers,'residual':{'kind':'input','dtype':'bf16','shape':[128,20480]}}
  used={v['buf'] for p in programs.values() for c in p['calls'] for v in c['args'] if 'buf'in v};buffers={n:b for n,b in buffers.items() if n in used}
  for name in ('output','prefill.hashes','prefill.engram.embedding'):buffers[name]['kind']='output'

@@ -33,7 +33,13 @@ class CompressedAttention:
                                 auxiliary_cubin=self.auxiliary_cubin)
             buffers.update(published.lowered.buffers)
             calls.extend(published.lowered.calls)
-            self.commits.extend(published.commit)
+            # A plain step commits where it publishes, so a source's state and
+            # projections never outlive its layer group; verification defers
+            # to its accepted count.
+            if self.mode == "verify":
+                self.commits.extend(published.commit)
+            else:
+                calls.extend(published.commit)
         if self.source is None:
             raise ValueError("compressed KV source must be lowered before consumers")
         ratio = dict(self.serving.layout.sources)[self.source]

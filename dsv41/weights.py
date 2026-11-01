@@ -46,9 +46,10 @@ def bindings(tensors, config, ep=4, engram="host"):
     Host descriptors declare mapped host placement. The serving loader shares
     one checkpoint scope across ranks; these never become HBM weights.
     The Engram tables are host descriptors (`engram="host"`: one copy in the
-    tray's host memory, read through ATS; a GB300) or sharded into HBM across
-    the EP group with a `<name>.peers` array each (`engram="device"`: a
-    device that cannot read host memory at speed; an HGX B300).
+    tray's host memory, read through ATS; a GB300) or in HBM (`engram="device"`:
+    a device that cannot read host memory at speed, an HGX B300; or a pipeline
+    stage, whose one GPU holds its layer's table whole), sharded across the EP
+    group with a `<name>.peers` array each when there is one.
     """
     if ep < 1:
         raise ValueError("EP must be positive")
@@ -61,6 +62,8 @@ def bindings(tensors, config, ep=4, engram="host"):
         if ".engram.embed." in name:
             if engram == "host":
                 host[name] = dict(raw(tensor, name), placement="host")
+            elif ep == 1:
+                gpu[name] = raw(tensor, name)
             else:
                 gpu[name] = sharded(tensor, name, ep)
                 gpu[name + ".peers"] = peers(name, ep)
@@ -83,7 +86,7 @@ def bindings(tensors, config, ep=4, engram="host"):
         gpu[f"{prefix}.{suffix}"] = {
             "dtype": DTYPES[first["dtype"]], "shape": [local, *first["shape"]],
             "kind": "weight",
-            "bind": [{"tensor": {"group": "ep", "tensors": [
+            "bind": [{"tensor": entries[i][0]} if ep == 1 else {"tensor": {"group": "ep", "tensors": [
                 entries[rank * local + i][0] for rank in range(ep)
             ]}} for i in range(local)],
         }
