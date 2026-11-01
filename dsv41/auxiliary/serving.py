@@ -54,7 +54,6 @@ class Layout:
     draft_layers: int = 3
     sources: tuple = ((2, 2), (8, 2), (14, 2), (20, 1))
     replay: int = 0
-    pipelined: bool = False
 
     def __post_init__(self):
         if self.max_seqs < 1 or self.max_tokens < 6 * self.max_seqs:
@@ -78,15 +77,6 @@ class Layout:
         position modulo ring: the 128 a step reads and the 128 it writes
         last never share a slot."""
         return 256
-
-    @property
-    def compressor_bytes(self):
-        """A compressor's per-sequence state: 4096 bytes, or a whole window
-        line when the manifest is cut into pipeline stages. `kern cut` points
-        a stage's `window.lines` at the first per-sequence state it keeps,
-        which past stage 0 is a compressor's, and a line table's stride
-        must divide its state's bytes per sequence."""
-        return self.ring * 528 if self.pipelined else 4096
 
     @property
     def work_rows(self):
@@ -324,7 +314,7 @@ def build(cubin: Path, layout=Layout(), peers=None):
         states[f"compressed.{source}"] = {"bytes_per_token": 288 // ratio}
         states[f"index_k.{source}"] = {"bytes_per_token": index_page_stride(layout.page_size // ratio) // layout.page_size}
         if ratio == 2:
-            states[f"compressor.{source}"] = {"bytes_per_seq": layout.compressor_bytes}
+            states[f"compressor.{source}"] = {"bytes_per_seq": 4096}
             buffers[f"compressor.{source}.lines"] = {"kind": "input", "dtype": "i32", "shape": [1, "seqs"],
                 "domain": {"index_into": f"compressor.{source}", "stride": 4096}}
     modules, all_ops = {}, {}

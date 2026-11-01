@@ -69,8 +69,7 @@ def generate(raw, constants, *, kernels, capacity=128, max_seqs=16, context=3276
     expert_buffers, expert_load, expert_layouts = expert_weights(projections,pieces,cubin_dir=cubin_dir)
     barrier_buffers, clears = barriers(pieces,cubin_dir=cubin_dir,kind="carry" if ranks > 1 else "workspace")
     engram = engram_shards(raw)
-    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context,replay=replay,
-                                           pipelined=bool(stages)),
+    serving = build(auxiliary_cubin,Layout(max_tokens=capacity,max_seqs=max_seqs,max_context=context,replay=replay),
                     peers=cubin("dsv41_engram_peers") if engram else None)
     buffers = {**dense_buffers,**expert_buffers,**barrier_buffers,**constants["buffers"]}
     pieces.fixed((constants["modules"],constants["ops"]))
