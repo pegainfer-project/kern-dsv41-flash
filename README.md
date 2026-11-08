@@ -14,6 +14,9 @@ into the cubins a manifest pins, and [`dsv41/`](dsv41/README.md): the
 manifest generator, the operator oracles against the checkpoint's own
 `inference/` code, and the GPU harnesses over kern's public API (a Cargo
 workspace pinned to the kern commit whose schema the generator writes).
+[`docs/deepseek-v41-kernels.md`](docs/deepseek-v41-kernels.md) is the kernel
+selection log behind it, with the measured performance in
+[`docs/figures/dsv41-performance/`](docs/figures/dsv41-performance/).
 
 ## Build
 
